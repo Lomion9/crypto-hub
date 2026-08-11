@@ -159,10 +159,7 @@ def get_custom_huobi_data(category='linear'):
         return 0, 0
 
 def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
-    """Bugün UTC 00:00'dan (TR saatiyle 03:00) itibaren biriken net alım-satım baskısını (CVD)
-    BTC cinsinden hesaplar. Rolling 24s pencere yerine gün başlangıcından biriktirme kullanıyoruz;
-    böylece sayı 'bugün şu ana kadar net ne oldu' diye net bir anlam taşıyor, dünün kuyruğunu
-    sessizce içine katmıyor."""
+
     try:
         now_utc = datetime.now(timezone.utc)
         day_start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -269,13 +266,13 @@ def load_history(path=HISTORY_FILE):
 
 def funding_status(current_funding):
     current_funding = float(current_funding)
-    if current_funding > 0.030:
+    if current_funding > 0.0030:
         return "Aşırı Pozitif"
-    elif current_funding > 0.0:
+    elif current_funding > 0.0000:
         return "Pozitif"
-    elif current_funding < -0.030:
+    elif current_funding < -0.0030:
         return "Aşırı Negatif"
-    elif current_funding < 0.0:
+    elif current_funding < 0.0000:
         return "Negatif"
     return "Nötr"
 
