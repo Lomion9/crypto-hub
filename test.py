@@ -7,12 +7,52 @@ from openpyxl import load_workbook, Workbook
 from datetime import datetime, timedelta, timezone
 
 # ==========================================
+# 0. TELEGRAM BİLDİRİMİ
+# ==========================================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+def send_telegram_message(text, parse_mode="HTML"):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("  ⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tanımlı değil, mesaj gönderilmedi.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": parse_mode
+        }, timeout=10)
+        if not resp.ok:
+            print(f"  ❌ Telegram gönderim hatası: {resp.text}")
+    except Exception as e:
+        print(f"  ❌ Telegram gönderim hatası: {e}")
+
+def build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, cvd_perp, snap_row):
+    lines = []
+    if failed_borsalar:
+        lines.append(f"⚠️ <b>Bağlantı Sağlanamayan Borsalar:</b> {', '.join(failed_borsalar)}")
+        lines.append("")
+    lines.append(f"🌍 <b>Toplam OI:</b> {total_oi:,.2f} BTC")
+    lines.append(f"⚖️ <b>Küresel Funding (8s):</b> %{global_funding:+.4f}")
+    lines.append(f"📊 <b>Spot CVD:</b> {cvd_spot:+.2f} BTC")
+    lines.append(f"📊 <b>Perp CVD:</b> {cvd_perp:+.2f} BTC")
+    lines.append("")
+    lines.append("🎯 <b>ANLIK SİNYAL DURUMU</b>")
+    lines.append(f"Fiyat Durumu   : {snap_row['fiyat_durum']}")
+    lines.append(f"OI Durumu      : {snap_row['oi_durum']}")
+    lines.append(f"Funding Durumu : {snap_row['funding_durum']}")
+    lines.append(f"CVD Durumu     : {snap_row['cvd_durum']}")
+    lines.append(f"🧭 GENEL DURUM : {snap_row['genel_durum']}")
+    return "\n".join(lines)
+
+# ==========================================
 # 1. STANDART CCXT İLE ÇALIŞANLAR
 # ==========================================
 def get_standard_ccxt_data(exchange_name, symbol):
     try:
         exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+        exchange = exchange_class({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'timeout': 10000})
         
         oi_data = exchange.fetch_open_interest(symbol)
         oi = float(oi_data.get('baseVolume') or oi_data.get('openInterest') or 0)
@@ -29,7 +69,7 @@ def get_standard_ccxt_data(exchange_name, symbol):
 # ==========================================
 def get_custom_bybit_data(category='linear', symbol='BTCUSDT'):
     try:
-        bybit = ccxt.bybit({'enableRateLimit': True})
+        bybit = ccxt.bybit({'enableRateLimit': True, 'timeout': 10000})
         resp_oi = bybit.publicGetV5MarketOpenInterest({'category': category, 'symbol': symbol, 'intervalTime': '5min'})
         oi = float(resp_oi['result']['list'][0]['openInterest'])
         
@@ -47,7 +87,7 @@ def get_custom_bybit_data(category='linear', symbol='BTCUSDT'):
 def get_custom_hyperliquid_data():
     try:
         url = "https://api.hyperliquid.xyz/info"
-        res = requests.post(url, json={"type": "metaAndAssetCtxs"}).json()
+        res = requests.post(url, json={"type": "metaAndAssetCtxs"}, timeout=10).json()
         btc_idx = next(i for i, asset in enumerate(res[0]['universe']) if asset['name'] == 'BTC')
         
         oi = float(res[1][btc_idx]['openInterest'])
@@ -135,6 +175,10 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
             'startTime': start_ms, 'endTime': end_ms, 'limit': 1000
         }, timeout=10).json()
 
+        if not isinstance(res, list):
+            print(f"  ❌ Binance CVD Hata ({market_type}): beklenmeyen cevap -> {res}")
+            return 0.0
+
         cvd_btc = 0.0
         for candle in res:
             total_vol = float(candle[5])
@@ -166,7 +210,7 @@ def get_global_macro_data():
 
     if markets['Binance_USDT'][0] == 0:
         try:
-            resp = ccxt.binance({'enableRateLimit': True}).fapiPublicGetOpenInterest({'symbol': 'BTCUSDT'})
+            resp = ccxt.binance({'enableRateLimit': True, 'timeout': 10000}).fapiPublicGetOpenInterest({'symbol': 'BTCUSDT'})
             markets['Binance_USDT'] = (float(resp.get('openInterest', 0)), get_standard_ccxt_data('binance', 'BTC/USDT:USDT')[1])
         except: pass
 
@@ -176,6 +220,7 @@ def get_global_macro_data():
     # Silinen Borsa Loglarını Geri Getirdik
     print("\n--- Borsa ve Tahta Kırılımları (Funding 8s'e normalize edilmiş) ---")
     normalized = {}
+    failed_borsalar = []
     for borsa, (oi, funding) in markets.items():
         funding_8h = hl_funding_8h_real if (borsa == 'Hyperliquid' and hl_funding_8h_real is not None) else funding * (8 / FUNDING_INTERVAL_HOURS[borsa])
         normalized[borsa] = (oi, funding_8h)
@@ -183,6 +228,7 @@ def get_global_macro_data():
             etiket = "Funding(8s, gerçek)" if (borsa == 'Hyperliquid' and hl_funding_8h_real is not None) else "Funding(8s)"
             print(f"  ✅ {borsa.ljust(15)}: OI = {oi:>10,.2f} BTC  |  {etiket} = %{funding_8h:+.4f}")
         else:
+            failed_borsalar.append(borsa)
             print(f"  ❌ {borsa.ljust(15)}: Bağlantı Sağlanamadı / Veri 0")
 
     total_oi_btc = sum(oi for oi, _ in normalized.values() if oi > 0)
@@ -193,7 +239,7 @@ def get_global_macro_data():
     print(f"  🌍 KÜRESEL TOPLAM OI         : {total_oi_btc:,.2f} BTC")
     print(f"  ⚖️ AĞIRLIKLI FONLAMA ORANI (8s): %{global_weighted_funding:+.4f}\n")
 
-    return total_oi_btc, global_weighted_funding
+    return total_oi_btc, global_weighted_funding, failed_borsalar
 
 # ==========================================
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
@@ -225,41 +271,85 @@ def funding_status(current_funding):
     current_funding = float(current_funding)
     if current_funding > 0.030:
         return "Aşırı Pozitif"
-    if current_funding > 0.0:
-        return "Nötr Pozitif"
-    if current_funding < -0.030:
+    elif current_funding > 0.0:
+        return "Pozitif"
+    elif current_funding < -0.030:
         return "Aşırı Negatif"
-    if current_funding < 0.0:
-        return "Nötr Negatif"
+    elif current_funding < 0.0:
+        return "Negatif"
     return "Nötr"
 
 
 def compute_signals(df, current_oi, current_funding, current_price):
-    """Son 3 kayda bakarak ivme (momentum) sinyallerini üretir"""
+    """Üç katmanlı ivme (momentum) sinyali üretir:
+    - Kısa vade: son 3 kayda (yaklaşık 45dk) göre ani spike'ları yakalar.
+    - Orta vade: son 8 kayda (yaklaşık 2 saat) göre hızlıca gelişen bleed'leri yakalar.
+    - Gün başı anchor: bugünün İLK kaydına göre kümülatif kayma — saatlerce yayılan,
+      her adımda küçük ama toplamda büyük olan yavaş bleed'leri yakalar (Pine'daki
+      "1D" anchor mantığının aynısı).
+    Üçü de aynı anda çalışır, herhangi biri tetiklenirse sinyal verilir.
+    Not: df tüm geçmiş günleri içerebileceğinden, önce bugünün kayıtlarına filtreleniyor
+    — aksi halde 'gün başı' referansı yanlışlıkla dünün verisinden gelebilir.
+    Eşikler 11.08.2026 verisinden kalibre edildi; daha fazla veri biriktikçe (özellikle
+    volatil günler) yeniden ayarlanmalı."""
     fund_status = funding_status(current_funding)
 
-    OI_THRESHOLD = 1000.0   
-    PRICE_THRESHOLD = 150.0 
-    
-    if len(df) >= 3:
-        last_3 = df.tail(3)
-        max_oi = last_3['oi_btc'].max()
-        min_oi = last_3['oi_btc'].min()
-        
-        if current_oi > (max_oi + OI_THRESHOLD): oi_status = "Artıyor"
-        elif current_oi < (min_oi - OI_THRESHOLD): oi_status = "Düşüyor"
-        else: oi_status = "Nötr"
-            
-        max_price = last_3['price'].max()
-        min_price = last_3['price'].min()
-        
-        if current_price > (max_price + PRICE_THRESHOLD): price_status = "Artıyor"
-        elif current_price < (min_price - PRICE_THRESHOLD): price_status = "Düşüyor"
-        else: price_status = "Nötr"
-    else:
+    today_str = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
+    df_today = df[df['tarih'] == today_str] if ('tarih' in df.columns and len(df) > 0) else df.iloc[0:0]
+
+    # Katman 1 — kısa vade: gürültü tabanının (~446 BTC / ~120$, 3-kayıt penceresi) ~2 katı
+    OI_THRESHOLD = 600.0
+    PRICE_THRESHOLD = 80.0
+    short_oi_up = short_oi_down = short_price_up = short_price_down = False
+    if len(df_today) >= 3:
+        last_3 = df_today.tail(3)
+        max_oi, min_oi = last_3['oi_btc'].max(), last_3['oi_btc'].min()
+        short_oi_up = current_oi > (max_oi + OI_THRESHOLD)
+        short_oi_down = current_oi < (min_oi - OI_THRESHOLD)
+        max_price, min_price = last_3['price'].max(), last_3['price'].min()
+        short_price_up = current_price > (max_price + PRICE_THRESHOLD)
+        short_price_down = current_price < (min_price - PRICE_THRESHOLD)
+
+    # Katman 2 — orta vade: ~2 saatlik pencere, yüzdesel
+    OI_MID_PCT = 0.8
+    PRICE_MID_PCT = 0.5
+    MID_WINDOW = 8
+    mid_oi_up = mid_oi_down = mid_price_up = mid_price_down = False
+    if len(df_today) >= MID_WINDOW:
+        window = df_today.tail(MID_WINDOW)
+        ref_oi, ref_price = window['oi_btc'].iloc[0], window['price'].iloc[0]
+        oi_chg = (current_oi - ref_oi) / ref_oi * 100
+        price_chg = (current_price - ref_price) / ref_price * 100
+        mid_oi_up = oi_chg > OI_MID_PCT
+        mid_oi_down = oi_chg < -OI_MID_PCT
+        mid_price_up = price_chg > PRICE_MID_PCT
+        mid_price_down = price_chg < -PRICE_MID_PCT
+
+    # Katman 3 — gün başı anchor: yavaş, kalıcı bleed
+    OI_ANCHOR_PCT = 1.0
+    PRICE_ANCHOR_PCT = 0.6
+    anchor_oi_up = anchor_oi_down = anchor_price_up = anchor_price_down = False
+    if len(df_today) >= 1:
+        anchor_oi, anchor_price = df_today['oi_btc'].iloc[0], df_today['price'].iloc[0]
+        oi_chg = (current_oi - anchor_oi) / anchor_oi * 100
+        price_chg = (current_price - anchor_price) / anchor_price * 100
+        anchor_oi_up = oi_chg > OI_ANCHOR_PCT
+        anchor_oi_down = oi_chg < -OI_ANCHOR_PCT
+        anchor_price_up = price_chg > PRICE_ANCHOR_PCT
+        anchor_price_down = price_chg < -PRICE_ANCHOR_PCT
+
+    if len(df_today) < 3:
         oi_status = "Veri Bekleniyor"
         price_status = "Veri Bekleniyor"
-        
+    else:
+        if short_oi_up or mid_oi_up or anchor_oi_up: oi_status = "Artıyor"
+        elif short_oi_down or mid_oi_down or anchor_oi_down: oi_status = "Düşüyor"
+        else: oi_status = "Nötr"
+
+        if short_price_up or mid_price_up or anchor_price_up: price_status = "Artıyor"
+        elif short_price_down or mid_price_down or anchor_price_down: price_status = "Düşüyor"
+        else: price_status = "Nötr"
+
     return fund_status, oi_status, price_status
 
 def cvd_durumu(cvd_spot, cvd_perp):
@@ -279,15 +369,14 @@ def cvd_durumu(cvd_spot, cvd_perp):
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
-    """Funding+OI+fiyat kombinasyonuyla squeeze/trap setup'larını tespit eder.
-    Yükseliş tarafı: Short Squeeze (zayıf temel) vs Sağlıklı Long (organik talek destekli).
-    Düşüş tarafı: Long Trap (OI artıyor - tuzağa düşme, henüz tasfiye değil) vs
-    Long Squeeze (OI düşüyor - gerçek tasfiye/likidasyon şelalesi devam ediyor).
-    Her iki düşüş senaryosunda da 'emniyet kilidi': spot alım baskısı perp tarafındaki
-    satış/likidasyon baskısını (mutlak değerce) aşıyorsa, bu bir balina emilimi (absorption)
-    olabilir - kör 'Short' sinyali vermek yerine uyarı döndürülüyor."""
-    fund_positive = fund_status in ("Pozitif", "Aşırı Pozitif", "Nötr Pozitif")
-    fund_negative = fund_status in ("Negatif", "Aşırı Negatif", "Nötr Negatif")
+    """
+    Tetikleyici Şartı: 
+    Piyasa yapıcıların tasfiye (likidasyon) avına çıkması için fonlamanın 
+    'Nötr Pozitif/Negatif' değil, 'Aşırı' seviyelerde olması gerekir.
+    """
+    # Sadece AŞIRI durumlar Squeeze veya Trap kurulumlarını tetikler
+    fund_positive = (fund_status == "Aşırı Pozitif")
+    fund_negative = (fund_status == "Aşırı Negatif")
 
     yukselis_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
     long_trap = (fund_positive and oi_status == "Artıyor" and price_status == "Düşüyor")
@@ -302,6 +391,7 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
         return "Long Trap (Devam Riski)" if long_trap else "Long Squeeze (Tasfiye Devam Ediyor)"
 
+    # Fonlama Nötr Pozitif veya Nötr Negatif ise herhangi bir tasfiye setup'ı aranmaz
     return "İşlem Açma"
 
 def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
@@ -384,7 +474,7 @@ def print_trend_report(df):
     print("-" * 60)
 
 def run_snapshot_and_report():
-    total_oi, global_funding = get_global_macro_data()
+    total_oi, global_funding, failed_borsalar = get_global_macro_data()
     price = get_btc_price()
     
     # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
@@ -392,10 +482,14 @@ def run_snapshot_and_report():
     cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
     cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
     
-    print(f"  📊 Spot CVD (24s) : {cvd_spot:+.2f} BTC")
-    print(f"  📊 Perp CVD (24s) : {cvd_perp:+.2f} BTC\n")
+    print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
+    print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
     
-    log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
+    snap_df = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
+
+    report_text = build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, cvd_perp, snap_df.iloc[0])
+    send_telegram_message(report_text)
+
     df = load_history()
     print_trend_report(df)
     return df
