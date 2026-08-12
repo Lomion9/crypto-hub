@@ -1,16 +1,97 @@
 import ccxt
 import requests
 import pandas as pd
+import numpy as np
 import os
 import time
+import json
 from openpyxl import load_workbook, Workbook
 from datetime import datetime, timedelta, timezone
+
+# ==========================================
+# -1. AYARLAR (config.json)
+# ==========================================
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+DEFAULT_CONFIG = {
+    "signal_thresholds": {
+        "oi_short_btc": 600.0,
+        "price_short_usd": 80.0,
+        "oi_mid_pct": 0.8,
+        "price_mid_pct": 0.5,
+        "mid_window": 8,
+        "oi_anchor_pct": 1.0,
+        "price_anchor_pct": 0.6
+    },
+    "funding_thresholds": {
+        "extreme_pct": 0.0030
+    },
+    "adaptive_thresholds": {
+        "enabled": False,
+        "lookback_days": 7,
+        "min_days_required": 3,
+        "noise_percentile": 75,
+        "short_multiplier": 2.0,
+        "mid_multiplier": 2.0,
+        "anchor_multiplier": 2.0,
+        "min_oi_short_btc": 300.0,
+        "min_price_short_usd": 40.0,
+        "min_oi_mid_pct": 0.4,
+        "min_price_mid_pct": 0.25,
+        "min_oi_anchor_pct": 0.5,
+        "min_price_anchor_pct": 0.3
+    },
+    "telegram": {
+        "min_interval_minutes": 60
+    }
+}
+
+def load_config():
+    """config.json varsa oradan okur; yoksa (ilk çalıştırma) varsayılan değerlerle
+    dosyayı kendisi oluşturur. Eşikleri değiştirmek için artık kod açmana gerek yok —
+    sadece config.json içindeki sayıyı değiştirip kaydetmen yeterli (script'i yeniden
+    başlattığında yeni değerler devreye girer)."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                user_config = json.load(f)
+            merged = json.loads(json.dumps(DEFAULT_CONFIG))  # derin kopya
+            for section, values in user_config.items():
+                if section in merged and isinstance(values, dict):
+                    merged[section].update(values)
+                else:
+                    merged[section] = values
+            return merged
+        except Exception as e:
+            print(f"  ⚠️ config.json okunamadı ({e}), varsayılan ayarlar kullanılıyor.")
+            return DEFAULT_CONFIG
+    else:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+        print(f"  ℹ️ config.json bulunamadı, varsayılan ayarlarla oluşturuldu: {CONFIG_PATH}")
+        return DEFAULT_CONFIG
+
+CONFIG = load_config()
 
 # ==========================================
 # 0. TELEGRAM BİLDİRİMİ
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+_LAST_TELEGRAM_SENT = None
+
+def should_send_telegram():
+    """Telegram mesajını, config'deki min_interval_minutes'e göre saatte bir
+    (varsayılan 60 dk) gönderir. Script her 15dk'da bir snapshot alsa bile,
+    Telegram'a spam gitmesin diye bu kontrolden geçer."""
+    global _LAST_TELEGRAM_SENT
+    min_dk = CONFIG.get('telegram', {}).get('min_interval_minutes', 60)
+    now = datetime.now(timezone(timedelta(hours=3)))
+    if _LAST_TELEGRAM_SENT is None or (now - _LAST_TELEGRAM_SENT).total_seconds() >= min_dk * 60:
+        _LAST_TELEGRAM_SENT = now
+        return True
+    return False
 
 def send_telegram_message(text, parse_mode="HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -34,6 +115,7 @@ def build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, c
         lines.append(f"⚠️ <b>Bağlantı Sağlanamayan Borsalar:</b> {', '.join(failed_borsalar)}")
         lines.append("")
     lines.append(f"🌍 <b>Toplam OI:</b> {total_oi:,.2f} BTC")
+    lines.append(f"💰 <b>Fiyat:</b> ${snap_row['price']:,.2f}")
     lines.append(f"⚖️ <b>Küresel Funding (8s):</b> %{global_funding:+.4f}")
     lines.append(f"📊 <b>Spot CVD:</b> {cvd_spot:+.2f} BTC")
     lines.append(f"📊 <b>Perp CVD:</b> {cvd_perp:+.2f} BTC")
@@ -186,21 +268,35 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
         print(f"  ❌ Binance CVD Hata ({market_type}): {e}")
         return 0.0
 
+def fetch_with_retry(fetch_func, *args, retries=2, delay=3, **kwargs):
+    """Bir borsa çağrısı geçici bir hatadan (network blip, rate limit, borsanın
+    anlık kesintisi vb.) dolayı 0 dönerse, tüm satırı 'başarısız' loglamadan önce
+    birkaç kez daha dener. Kalıcı bir sorun varsa (borsa gerçekten çökmüşse)
+    yine de son denemeden sonra 0,0 döner ve failed_borsalar listesine düşer."""
+    oi, funding = 0, 0
+    for attempt in range(retries + 1):
+        oi, funding = fetch_func(*args, **kwargs)
+        if oi > 0:
+            return oi, funding
+        if attempt < retries:
+            time.sleep(delay)
+    return oi, funding
+
 # ==========================================
 # 3. KÜRESEL AĞIRLIKLI HESAPLAMA MOTORU
 # ==========================================
 def get_global_macro_data():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🌐 USDT ve USD Tahtalarından Makro Veriler Toplanıyor...")
     markets = {
-        'Binance_USDT': get_standard_ccxt_data('binance', 'BTC/USDT:USDT'),
-        'Binance_USD': get_custom_binance_usd_data(),
-        'Bybit_USDT': get_custom_bybit_data(category='linear', symbol='BTCUSDT'),
-        'Bybit_USD': get_custom_bybit_data(category='inverse', symbol='BTCUSD'),
-        'OKX_USDT': get_standard_ccxt_data('okx', 'BTC/USDT:USDT'),
-        'OKX_USD': get_standard_ccxt_data('okx', 'BTC/USD:BTC'),
-        'Huobi_USDT': get_custom_huobi_data(category='linear'),
-        'Huobi_USD': get_custom_huobi_data(category='inverse'),
-        'Hyperliquid': get_custom_hyperliquid_data()
+        'Binance_USDT': fetch_with_retry(get_standard_ccxt_data, 'binance', 'BTC/USDT:USDT'),
+        'Binance_USD': fetch_with_retry(get_custom_binance_usd_data),
+        'Bybit_USDT': fetch_with_retry(get_custom_bybit_data, category='linear', symbol='BTCUSDT'),
+        'Bybit_USD': fetch_with_retry(get_custom_bybit_data, category='inverse', symbol='BTCUSD'),
+        'OKX_USDT': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USDT:USDT'),
+        'OKX_USD': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USD:BTC'),
+        'Huobi_USDT': fetch_with_retry(get_custom_huobi_data, category='linear'),
+        'Huobi_USD': fetch_with_retry(get_custom_huobi_data, category='inverse'),
+        'Hyperliquid': fetch_with_retry(get_custom_hyperliquid_data)
     }
     
     hl_funding_8h_real = get_hyperliquid_funding_8h_real('BTC')
@@ -266,15 +362,94 @@ def load_history(path=HISTORY_FILE):
 
 def funding_status(current_funding):
     current_funding = float(current_funding)
-    if current_funding > 0.0030:
+    esik = CONFIG['funding_thresholds']['extreme_pct']
+    if current_funding > esik:
         return "Aşırı Pozitif"
     elif current_funding > 0.0000:
         return "Pozitif"
-    elif current_funding < -0.0030:
+    elif current_funding < -esik:
         return "Aşırı Negatif"
     elif current_funding < 0.0000:
         return "Negatif"
     return "Nötr"
+
+
+def compute_adaptive_thresholds(df):
+    """Sabit eşikler yerine, son N GÜNÜN (bugün hariç — gün henüz bitmediği için
+    yanıltıcı olur) gerçek OI/fiyat oynaklığına bakarak eşikleri kendiliğinden ayarlar.
+    Mantık, elle yaptığımız 'gürültü tabanı' analizinin otomatikleştirilmiş hali:
+    her gün için 3 katmanın (kısa/orta/anchor) doğal salınımını ölçer, bunun belirli
+    bir yüzdelik dilimini (varsayılan %75) alıp bir güvenlik çarpanıyla (varsayılan 2x)
+    çarpar. Piyasa sakinse eşikler otomatik küçülür (daha hassas), hareketliyse büyür
+    (spam'e dönmez). Yeterli geçmiş yoksa (min_days_required) None döner, çağıran
+    taraf statik config değerlerine düşer."""
+    ac = CONFIG.get('adaptive_thresholds', {})
+    if not ac.get('enabled', False):
+        return None
+    if 'tarih' not in df.columns or len(df) == 0:
+        return None
+
+    df = df.copy()
+    df['_gun'] = pd.to_datetime(df['tarih'], format='%d.%m.%Y', errors='coerce').dt.date
+    bugun = datetime.now(timezone(timedelta(hours=3))).date()
+    df = df[(df['_gun'].notna()) & (df['_gun'] < bugun)]  # bugünü hariç tut, gün tamamlanmamış
+
+    tum_gunler = sorted(df['_gun'].unique())
+    if len(tum_gunler) < ac.get('min_days_required', 3):
+        return None
+
+    gunler = tum_gunler[-ac.get('lookback_days', 7):]
+    df = df[df['_gun'].isin(gunler)]
+    mid_window = CONFIG['signal_thresholds'].get('mid_window', 8)
+
+    short_oi, short_price = [], []
+    mid_oi_pct, mid_price_pct = [], []
+    anchor_oi_pct, anchor_price_pct = [], []
+
+    for gun in gunler:
+        gun_df = df[df['_gun'] == gun].sort_values('saat').reset_index(drop=True)
+        if len(gun_df) < 3:
+            continue
+
+        # Kısa vade: 3-kayıt pencere aralığı (mutlak)
+        oi_roll = gun_df['oi_btc'].rolling(3).apply(lambda x: x.max() - x.min()).dropna()
+        price_roll = gun_df['price'].rolling(3).apply(lambda x: x.max() - x.min()).dropna()
+        short_oi.extend(oi_roll.tolist())
+        short_price.extend(price_roll.tolist())
+
+        # Orta vade: mid_window'luk pencere yüzdesel değişim
+        if len(gun_df) >= mid_window:
+            for i in range(mid_window, len(gun_df) + 1):
+                w = gun_df.iloc[i - mid_window:i]
+                ref_oi, ref_price = w['oi_btc'].iloc[0], w['price'].iloc[0]
+                if ref_oi and ref_price:
+                    mid_oi_pct.append(abs(w['oi_btc'].iloc[-1] - ref_oi) / ref_oi * 100)
+                    mid_price_pct.append(abs(w['price'].iloc[-1] - ref_price) / ref_price * 100)
+
+        # Anchor: günün tamamının toplam salınımı (yüzdesel)
+        ref_oi, ref_price = gun_df['oi_btc'].iloc[0], gun_df['price'].iloc[0]
+        if ref_oi and ref_price:
+            anchor_oi_pct.append(abs(gun_df['oi_btc'].iloc[-1] - ref_oi) / ref_oi * 100)
+            anchor_price_pct.append(abs(gun_df['price'].iloc[-1] - ref_price) / ref_price * 100)
+
+    def yuzdelik(values, varsayilan):
+        if not values:
+            return varsayilan
+        return float(np.percentile(values, ac.get('noise_percentile', 75)))
+
+    st = CONFIG['signal_thresholds']
+    sm, mm, am = ac.get('short_multiplier', 2.0), ac.get('mid_multiplier', 2.0), ac.get('anchor_multiplier', 2.0)
+
+    sonuc = {
+        'oi_short_btc': max(yuzdelik(short_oi, st['oi_short_btc']) * sm, ac.get('min_oi_short_btc', 300.0)),
+        'price_short_usd': max(yuzdelik(short_price, st['price_short_usd']) * sm, ac.get('min_price_short_usd', 40.0)),
+        'oi_mid_pct': max(yuzdelik(mid_oi_pct, st['oi_mid_pct']) * mm, ac.get('min_oi_mid_pct', 0.4)),
+        'price_mid_pct': max(yuzdelik(mid_price_pct, st['price_mid_pct']) * mm, ac.get('min_price_mid_pct', 0.25)),
+        'mid_window': mid_window,
+        'oi_anchor_pct': max(yuzdelik(anchor_oi_pct, st['oi_anchor_pct']) * am, ac.get('min_oi_anchor_pct', 0.5)),
+        'price_anchor_pct': max(yuzdelik(anchor_price_pct, st['price_anchor_pct']) * am, ac.get('min_price_anchor_pct', 0.3)),
+    }
+    return sonuc
 
 
 def compute_signals(df, current_oi, current_funding, current_price):
@@ -294,9 +469,12 @@ def compute_signals(df, current_oi, current_funding, current_price):
     today_str = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
     df_today = df[df['tarih'] == today_str] if ('tarih' in df.columns and len(df) > 0) else df.iloc[0:0]
 
+    adaptif = compute_adaptive_thresholds(df)
+    st = adaptif if adaptif else CONFIG['signal_thresholds']
+
     # Katman 1 — kısa vade: gürültü tabanının (~446 BTC / ~120$, 3-kayıt penceresi) ~2 katı
-    OI_THRESHOLD = 600.0
-    PRICE_THRESHOLD = 80.0
+    OI_THRESHOLD = st['oi_short_btc']
+    PRICE_THRESHOLD = st['price_short_usd']
     short_oi_up = short_oi_down = short_price_up = short_price_down = False
     if len(df_today) >= 3:
         last_3 = df_today.tail(3)
@@ -308,9 +486,9 @@ def compute_signals(df, current_oi, current_funding, current_price):
         short_price_down = current_price < (min_price - PRICE_THRESHOLD)
 
     # Katman 2 — orta vade: ~2 saatlik pencere, yüzdesel
-    OI_MID_PCT = 0.8
-    PRICE_MID_PCT = 0.5
-    MID_WINDOW = 8
+    OI_MID_PCT = st['oi_mid_pct']
+    PRICE_MID_PCT = st['price_mid_pct']
+    MID_WINDOW = st['mid_window']
     mid_oi_up = mid_oi_down = mid_price_up = mid_price_down = False
     if len(df_today) >= MID_WINDOW:
         window = df_today.tail(MID_WINDOW)
@@ -323,8 +501,8 @@ def compute_signals(df, current_oi, current_funding, current_price):
         mid_price_down = price_chg < -PRICE_MID_PCT
 
     # Katman 3 — gün başı anchor: yavaş, kalıcı bleed
-    OI_ANCHOR_PCT = 1.0
-    PRICE_ANCHOR_PCT = 0.6
+    OI_ANCHOR_PCT = st['oi_anchor_pct']
+    PRICE_ANCHOR_PCT = st['price_anchor_pct']
     anchor_oi_up = anchor_oi_down = anchor_price_up = anchor_price_down = False
     if len(df_today) >= 1:
         anchor_oi, anchor_price = df_today['oi_btc'].iloc[0], df_today['price'].iloc[0]
@@ -367,26 +545,45 @@ def cvd_durumu(cvd_spot, cvd_perp):
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     """
-    Tetikleyici Şartı: 
-    Piyasa yapıcıların tasfiye (likidasyon) avına çıkması için fonlamanın 
+    Tetikleyici Şartı:
+    Piyasa yapıcıların tasfiye (likidasyon) avına çıkması için fonlamanın
     'Nötr Pozitif/Negatif' değil, 'Aşırı' seviyelerde olması gerekir.
+
+    Long ve Short taraf simetrik kurulmuştur:
+    - long_trap / short_trap: pozisyon HENÜZ birikiyor, fiyat aleyhte gidiyor (tuzak kuruluyor)
+    - long_squeeze / short_squeeze: pozisyon tasfiye OLUYOR, an itibariyle kapanış baskısı var
     """
-    # Sadece AŞIRI durumlar Squeeze veya Trap kurulumlarını tetikler
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
-    yukselis_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
+    # Long taraf: funding Aşırı Pozitif -> longlar baskın/kaldıraçlı
     long_trap = (fund_positive and oi_status == "Artıyor" and price_status == "Düşüyor")
     long_squeeze = (fund_positive and oi_status == "Düşüyor" and price_status == "Düşüyor")
 
-    if yukselis_squeeze:
+    # Short taraf: funding Aşırı Negatif -> shortlar baskın/kaldıraçlı (long tarafın aynası)
+    short_trap = (fund_negative and oi_status == "Artıyor" and price_status == "Artıyor")
+    short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
+
+    if short_squeeze:
         return "Sağlıklı Long (Squeeze + Organik Talep)" if cvd_spot > 0 else "Short Squeeze (Zayıf Temel)"
 
-    if long_trap or long_squeeze:
+    if long_squeeze:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
-        return "Long Trap (Devam Riski)" if long_trap else "Long Squeeze (Tasfiye Devam Ediyor)"
+        return "Sağlıklı Short (Squeeze + Organik Satış)" if cvd_spot < 0 else "Long Squeeze (Zayıf Temel)"
+
+    if long_trap:
+        absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
+        if absorption_riski:
+            return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
+        return "Long Trap (Devam Riski)"
+
+    if short_trap:
+        dagitim_riski = cvd_spot < 0 and abs(cvd_spot) > abs(cvd_perp)
+        if dagitim_riski:
+            return "İşlem Açma (Olası Dağıtım - Spot Satış Baskın)"
+        return "Short Trap (Devam Riski)"
 
     # Fonlama Nötr Pozitif veya Nötr Negatif ise herhangi bir tasfiye setup'ı aranmaz
     return "İşlem Açma"
@@ -485,7 +682,10 @@ def run_snapshot_and_report():
     snap_df = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
 
     report_text = build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, cvd_perp, snap_df.iloc[0])
-    send_telegram_message(report_text)
+    if should_send_telegram():
+        send_telegram_message(report_text)
+    else:
+        print("  ⏳ Telegram mesajı bu saat penceresinde zaten gönderildi, atlanıyor.")
 
     df = load_history()
     print_trend_report(df)

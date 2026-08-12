@@ -1,0 +1,32 @@
+{
+  "signal_thresholds": {
+    "oi_short_btc": 600.0,
+    "price_short_usd": 80.0,
+    "oi_mid_pct": 0.8,
+    "price_mid_pct": 0.5,
+    "mid_window": 8,
+    "oi_anchor_pct": 1.0,
+    "price_anchor_pct": 0.6
+  },
+  "funding_thresholds": {
+    "extreme_pct": 0.003
+  },
+  "adaptive_thresholds": {
+    "enabled": false,
+    "lookback_days": 7,
+    "min_days_required": 3,
+    "noise_percentile": 75,
+    "short_multiplier": 2.0,
+    "mid_multiplier": 2.0,
+    "anchor_multiplier": 2.0,
+    "min_oi_short_btc": 300.0,
+    "min_price_short_usd": 40.0,
+    "min_oi_mid_pct": 0.4,
+    "min_price_mid_pct": 0.25,
+    "min_oi_anchor_pct": 0.5,
+    "min_price_anchor_pct": 0.3
+  },
+  "telegram": {
+    "min_interval_minutes": 60
+  }
+}
