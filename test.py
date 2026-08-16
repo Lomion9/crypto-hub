@@ -5,6 +5,7 @@ import numpy as np
 import os
 import time
 import json
+import sqlite3
 from openpyxl import load_workbook, Workbook
 from datetime import datetime, timedelta, timezone
 
@@ -14,32 +15,16 @@ from datetime import datetime, timedelta, timezone
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 DEFAULT_CONFIG = {
-    "signal_thresholds": {
-        "oi_short_btc": 600.0,
-        "price_short_usd": 80.0,
-        "oi_mid_pct": 0.8,
-        "price_mid_pct": 0.5,
-        "mid_window": 8,
-        "oi_anchor_pct": 1.0,
-        "price_anchor_pct": 0.6
+    "timeframes": {
+        "15dk": {"periods": 1, "oi_pct": 0.31, "price_pct": 0.22},
+        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43},
+        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72},
+        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08},
+        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36},
+        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76}
     },
     "funding_thresholds": {
         "extreme_pct": 0.0030
-    },
-    "adaptive_thresholds": {
-        "enabled": False,
-        "lookback_days": 7,
-        "min_days_required": 3,
-        "noise_percentile": 75,
-        "short_multiplier": 2.0,
-        "mid_multiplier": 2.0,
-        "anchor_multiplier": 2.0,
-        "min_oi_short_btc": 300.0,
-        "min_price_short_usd": 40.0,
-        "min_oi_mid_pct": 0.4,
-        "min_price_mid_pct": 0.25,
-        "min_oi_anchor_pct": 0.5,
-        "min_price_anchor_pct": 0.3
     },
     "telegram": {
         "min_interval_minutes": 60
@@ -79,19 +64,26 @@ CONFIG = load_config()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-_LAST_TELEGRAM_SENT = None
+_LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
-def should_send_telegram():
-    """Telegram mesajını, config'deki min_interval_minutes'e göre saatte bir
-    (varsayılan 60 dk) gönderir. Script her 15dk'da bir snapshot alsa bile,
-    Telegram'a spam gitmesin diye bu kontrolden geçer."""
-    global _LAST_TELEGRAM_SENT
-    min_dk = CONFIG.get('telegram', {}).get('min_interval_minutes', 60)
-    now = datetime.now(timezone(timedelta(hours=3)))
-    if _LAST_TELEGRAM_SENT is None or (now - _LAST_TELEGRAM_SENT).total_seconds() >= min_dk * 60:
-        _LAST_TELEGRAM_SENT = now
-        return True
-    return False
+def should_send_telegram(tf_sonuclari):
+    """tf_sonuclari: {tf: {'genel_durum': ..., ...}}. Herhangi bir timeframe'in
+    genel_durum'u 'İşlem Açma' (veya henüz 'Veri Bekleniyor') DIŞINDA bir şey
+    gösterip kendi son gönderilen durumundan FARKLIYSA True döner — o an TÜM
+    timeframe'lerin durumu tek mesajda özetlenip gönderilir. Her timeframe kendi
+    değişimini bağımsız takip eder, birinin flicker'ı diğerini etkilemez."""
+    global _LAST_TELEGRAM_DURUMLAR
+    gonder = False
+    for tf, sonuc in tf_sonuclari.items():
+        gd = sonuc['genel_durum']
+        onceki = _LAST_TELEGRAM_DURUMLAR.get(tf)
+        if gd in ("İşlem Açma", "Veri Bekleniyor"):
+            _LAST_TELEGRAM_DURUMLAR[tf] = gd
+            continue
+        if gd != onceki:
+            gonder = True
+        _LAST_TELEGRAM_DURUMLAR[tf] = gd
+    return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -109,23 +101,24 @@ def send_telegram_message(text, parse_mode="HTML"):
     except Exception as e:
         print(f"  ❌ Telegram gönderim hatası: {e}")
 
-def build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, cvd_perp, snap_row):
+def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp, fund_status, tf_sonuclari, kapanan_islemler):
     lines = []
     if failed_borsalar:
         lines.append(f"⚠️ <b>Bağlantı Sağlanamayan Borsalar:</b> {', '.join(failed_borsalar)}")
         lines.append("")
     lines.append(f"🌍 <b>Toplam OI:</b> {total_oi:,.2f} BTC")
-    lines.append(f"💰 <b>Fiyat:</b> ${snap_row['price']:,.2f}")
-    lines.append(f"⚖️ <b>Küresel Funding (8s):</b> %{global_funding:+.4f}")
-    lines.append(f"📊 <b>Spot CVD:</b> {cvd_spot:+.2f} BTC")
-    lines.append(f"📊 <b>Perp CVD:</b> {cvd_perp:+.2f} BTC")
+    lines.append(f"💰 <b>Fiyat:</b> ${price:,.2f}")
+    lines.append(f"⚖️ <b>Küresel Funding (8s):</b> %{global_funding:+.4f}  ({fund_status})")
+    lines.append(f"📊 <b>Gün içi toplam CVD</b> — Spot: {cvd_spot:+.2f} BTC | Perp: {cvd_perp:+.2f} BTC")
     lines.append("")
-    lines.append("🎯 <b>ANLIK SİNYAL DURUMU</b>")
-    lines.append(f"Fiyat Durumu   : {snap_row['fiyat_durum']}")
-    lines.append(f"OI Durumu      : {snap_row['oi_durum']}")
-    lines.append(f"Funding Durumu : {snap_row['funding_durum']}")
-    lines.append(f"CVD Durumu     : {snap_row['cvd_durum']}")
-    lines.append(f"🧭 GENEL DURUM : {snap_row['genel_durum']}")
+    lines.append("🎯 <b>TIMEFRAME BAZLI SİNYAL DURUMU</b>")
+    for tf, sonuc in tf_sonuclari.items():
+        lines.append(f"[{tf}] {sonuc['genel_durum']}")
+    if kapanan_islemler:
+        lines.append("")
+        lines.append("💰 <b>KAPANAN SİNYALLER</b>")
+        for tf, k in kapanan_islemler.items():
+            lines.append(f"[{tf}] {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
     return "\n".join(lines)
 
 # ==========================================
@@ -337,9 +330,9 @@ def get_global_macro_data():
 # ==========================================
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
 # ==========================================
-HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi_funding_history.xlsx")
-COLUMNS = ['tarih', 'saat', 'oi_btc', 'oi_usd', 'funding_pct', 'price', 'cvd_spot_btc', 'cvd_perp_btc', 'funding_durum', 'oi_durum', 'fiyat_durum', 'cvd_durum', 'genel_durum']
-FUNDING_COL = COLUMNS.index('funding_pct') + 1
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi_funding_history.db")
+HISTORY_FILE = DB_FILE  # geri uyumluluk için aynı isim korunuyor
+VERI_COLS = ['tarih', 'saat', 'oi_btc', 'oi_usd', 'funding_pct', 'price', 'cvd_spot_btc', 'cvd_perp_btc']
 
 def get_btc_price():
     try:
@@ -347,18 +340,47 @@ def get_btc_price():
         return float(r['price'])
     except: return 0.0
 
-def load_history(path=HISTORY_FILE):
-    if not os.path.isfile(path):
-        return pd.DataFrame(columns=COLUMNS + ['timestamp'])
-    
-    df = pd.read_excel(path, engine='openpyxl')
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = 0.0 if col not in ['funding_durum', 'oi_durum', 'fiyat_durum', 'cvd_durum', 'genel_durum', 'tarih', 'saat'] else "N/A"
-            
-    df['funding_pct'] = df['funding_pct'].astype(float)
-    df['timestamp'] = pd.to_datetime(df['tarih'] + ' ' + df['saat'], format='%d.%m.%Y %H:%M')
-    return df.sort_values('timestamp').reset_index(drop=True)
+def _init_db(conn):
+    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem üçlüsü oluşturur.
+    durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır (otomatik artan değil, elle
+    veriliyor) — böylece hangi durum satırının hangi veri satırına ait olduğu asla
+    tarih+saat metin eşleşmesine bağlı kalmaz, id ile garanti hizalı kalır."""
+    conn.execute('''CREATE TABLE IF NOT EXISTS veri (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tarih TEXT, saat TEXT, oi_btc REAL, oi_usd REAL, funding_pct REAL,
+        price REAL, cvd_spot_btc REAL, cvd_perp_btc REAL
+    )''')
+    for tf in CONFIG['timeframes'].keys():
+        conn.execute(f'''CREATE TABLE IF NOT EXISTS durum_{tf} (
+            id INTEGER PRIMARY KEY,
+            tarih TEXT, saat TEXT, funding_durum TEXT, oi_durum TEXT,
+            fiyat_durum TEXT, cvd_durum TEXT, genel_durum TEXT
+        )''')
+        conn.execute(f'''CREATE TABLE IF NOT EXISTS sinyal_{tf} (
+            kapanis_tarih TEXT, kapanis_saat TEXT, sinyal TEXT, yon TEXT,
+            giris_tarih TEXT, giris_saat TEXT, giris_fiyat REAL, cikis_fiyat REAL, kar_yuzde REAL
+        )''')
+        conn.execute(f'''CREATE TABLE IF NOT EXISTS aktif_islem_{tf} (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            genel_durum TEXT, giris_fiyat REAL, giris_tarih TEXT, giris_saat TEXT, farkli_sayac INTEGER
+        )''')
+    conn.commit()
+
+def load_history(path=DB_FILE):
+    """Sadece 'veri' tablosunu okur — timeframe durumları artık geçmişe bakmak için
+    ayrı bir join gerektirmiyor, her timeframe kendi periyot kadar geriye gidip
+    doğrudan 'veri' tablosundaki oi_btc/price'a bakıyor (bkz. _periyot_durumu)."""
+    conn = sqlite3.connect(path)
+    _init_db(conn)
+    veri_df = pd.read_sql("SELECT * FROM veri", conn)
+    conn.close()
+
+    if veri_df.empty:
+        return pd.DataFrame(columns=VERI_COLS + ['timestamp'])
+
+    veri_df['funding_pct'] = veri_df['funding_pct'].astype(float)
+    veri_df['timestamp'] = pd.to_datetime(veri_df['tarih'] + ' ' + veri_df['saat'], format='%d.%m.%Y %H:%M')
+    return veri_df.sort_values('timestamp').reset_index(drop=True)
 
 def funding_status(current_funding):
     current_funding = float(current_funding)
@@ -373,159 +395,21 @@ def funding_status(current_funding):
         return "Negatif"
     return "Nötr"
 
-
-def compute_adaptive_thresholds(df):
-    """Sabit eşikler yerine, son N GÜNÜN (bugün hariç — gün henüz bitmediği için
-    yanıltıcı olur) gerçek OI/fiyat oynaklığına bakarak eşikleri kendiliğinden ayarlar.
-    Mantık, elle yaptığımız 'gürültü tabanı' analizinin otomatikleştirilmiş hali:
-    her gün için 3 katmanın (kısa/orta/anchor) doğal salınımını ölçer, bunun belirli
-    bir yüzdelik dilimini (varsayılan %75) alıp bir güvenlik çarpanıyla (varsayılan 2x)
-    çarpar. Piyasa sakinse eşikler otomatik küçülür (daha hassas), hareketliyse büyür
-    (spam'e dönmez). Yeterli geçmiş yoksa (min_days_required) None döner, çağıran
-    taraf statik config değerlerine düşer."""
-    ac = CONFIG.get('adaptive_thresholds', {})
-    if not ac.get('enabled', False):
-        return None
-    if 'tarih' not in df.columns or len(df) == 0:
-        return None
-
-    df = df.copy()
-    df['_gun'] = pd.to_datetime(df['tarih'], format='%d.%m.%Y', errors='coerce').dt.date
-    bugun = datetime.now(timezone(timedelta(hours=3))).date()
-    df = df[(df['_gun'].notna()) & (df['_gun'] < bugun)]  # bugünü hariç tut, gün tamamlanmamış
-
-    tum_gunler = sorted(df['_gun'].unique())
-    if len(tum_gunler) < ac.get('min_days_required', 3):
-        return None
-
-    gunler = tum_gunler[-ac.get('lookback_days', 7):]
-    df = df[df['_gun'].isin(gunler)]
-    mid_window = CONFIG['signal_thresholds'].get('mid_window', 8)
-
-    short_oi, short_price = [], []
-    mid_oi_pct, mid_price_pct = [], []
-    anchor_oi_pct, anchor_price_pct = [], []
-
-    for gun in gunler:
-        gun_df = df[df['_gun'] == gun].sort_values('saat').reset_index(drop=True)
-        if len(gun_df) < 3:
-            continue
-
-        # Kısa vade: 3-kayıt pencere aralığı (mutlak)
-        oi_roll = gun_df['oi_btc'].rolling(3).apply(lambda x: x.max() - x.min()).dropna()
-        price_roll = gun_df['price'].rolling(3).apply(lambda x: x.max() - x.min()).dropna()
-        short_oi.extend(oi_roll.tolist())
-        short_price.extend(price_roll.tolist())
-
-        # Orta vade: mid_window'luk pencere yüzdesel değişim
-        if len(gun_df) >= mid_window:
-            for i in range(mid_window, len(gun_df) + 1):
-                w = gun_df.iloc[i - mid_window:i]
-                ref_oi, ref_price = w['oi_btc'].iloc[0], w['price'].iloc[0]
-                if ref_oi and ref_price:
-                    mid_oi_pct.append(abs(w['oi_btc'].iloc[-1] - ref_oi) / ref_oi * 100)
-                    mid_price_pct.append(abs(w['price'].iloc[-1] - ref_price) / ref_price * 100)
-
-        # Anchor: günün tamamının toplam salınımı (yüzdesel)
-        ref_oi, ref_price = gun_df['oi_btc'].iloc[0], gun_df['price'].iloc[0]
-        if ref_oi and ref_price:
-            anchor_oi_pct.append(abs(gun_df['oi_btc'].iloc[-1] - ref_oi) / ref_oi * 100)
-            anchor_price_pct.append(abs(gun_df['price'].iloc[-1] - ref_price) / ref_price * 100)
-
-    def yuzdelik(values, varsayilan):
-        if not values:
-            return varsayilan
-        return float(np.percentile(values, ac.get('noise_percentile', 75)))
-
-    st = CONFIG['signal_thresholds']
-    sm, mm, am = ac.get('short_multiplier', 2.0), ac.get('mid_multiplier', 2.0), ac.get('anchor_multiplier', 2.0)
-
-    sonuc = {
-        'oi_short_btc': max(yuzdelik(short_oi, st['oi_short_btc']) * sm, ac.get('min_oi_short_btc', 300.0)),
-        'price_short_usd': max(yuzdelik(short_price, st['price_short_usd']) * sm, ac.get('min_price_short_usd', 40.0)),
-        'oi_mid_pct': max(yuzdelik(mid_oi_pct, st['oi_mid_pct']) * mm, ac.get('min_oi_mid_pct', 0.4)),
-        'price_mid_pct': max(yuzdelik(mid_price_pct, st['price_mid_pct']) * mm, ac.get('min_price_mid_pct', 0.25)),
-        'mid_window': mid_window,
-        'oi_anchor_pct': max(yuzdelik(anchor_oi_pct, st['oi_anchor_pct']) * am, ac.get('min_oi_anchor_pct', 0.5)),
-        'price_anchor_pct': max(yuzdelik(anchor_price_pct, st['price_anchor_pct']) * am, ac.get('min_price_anchor_pct', 0.3)),
-    }
-    return sonuc
-
-
-def compute_signals(df, current_oi, current_funding, current_price):
-    """Üç katmanlı ivme (momentum) sinyali üretir:
-    - Kısa vade: son 3 kayda (yaklaşık 45dk) göre ani spike'ları yakalar.
-    - Orta vade: son 8 kayda (yaklaşık 2 saat) göre hızlıca gelişen bleed'leri yakalar.
-    - Gün başı anchor: bugünün İLK kaydına göre kümülatif kayma — saatlerce yayılan,
-      her adımda küçük ama toplamda büyük olan yavaş bleed'leri yakalar (Pine'daki
-      "1D" anchor mantığının aynısı).
-    Üçü de aynı anda çalışır, herhangi biri tetiklenirse sinyal verilir.
-    Not: df tüm geçmiş günleri içerebileceğinden, önce bugünün kayıtlarına filtreleniyor
-    — aksi halde 'gün başı' referansı yanlışlıkla dünün verisinden gelebilir.
-    Eşikler 11.08.2026 verisinden kalibre edildi; daha fazla veri biriktikçe (özellikle
-    volatil günler) yeniden ayarlanmalı."""
-    fund_status = funding_status(current_funding)
-
-    today_str = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
-    df_today = df[df['tarih'] == today_str] if ('tarih' in df.columns and len(df) > 0) else df.iloc[0:0]
-
-    adaptif = compute_adaptive_thresholds(df)
-    st = adaptif if adaptif else CONFIG['signal_thresholds']
-
-    # Katman 1 — kısa vade: gürültü tabanının (~446 BTC / ~120$, 3-kayıt penceresi) ~2 katı
-    OI_THRESHOLD = st['oi_short_btc']
-    PRICE_THRESHOLD = st['price_short_usd']
-    short_oi_up = short_oi_down = short_price_up = short_price_down = False
-    if len(df_today) >= 3:
-        last_3 = df_today.tail(3)
-        max_oi, min_oi = last_3['oi_btc'].max(), last_3['oi_btc'].min()
-        short_oi_up = current_oi > (max_oi + OI_THRESHOLD)
-        short_oi_down = current_oi < (min_oi - OI_THRESHOLD)
-        max_price, min_price = last_3['price'].max(), last_3['price'].min()
-        short_price_up = current_price > (max_price + PRICE_THRESHOLD)
-        short_price_down = current_price < (min_price - PRICE_THRESHOLD)
-
-    # Katman 2 — orta vade: ~2 saatlik pencere, yüzdesel
-    OI_MID_PCT = st['oi_mid_pct']
-    PRICE_MID_PCT = st['price_mid_pct']
-    MID_WINDOW = st['mid_window']
-    mid_oi_up = mid_oi_down = mid_price_up = mid_price_down = False
-    if len(df_today) >= MID_WINDOW:
-        window = df_today.tail(MID_WINDOW)
-        ref_oi, ref_price = window['oi_btc'].iloc[0], window['price'].iloc[0]
-        oi_chg = (current_oi - ref_oi) / ref_oi * 100
-        price_chg = (current_price - ref_price) / ref_price * 100
-        mid_oi_up = oi_chg > OI_MID_PCT
-        mid_oi_down = oi_chg < -OI_MID_PCT
-        mid_price_up = price_chg > PRICE_MID_PCT
-        mid_price_down = price_chg < -PRICE_MID_PCT
-
-    # Katman 3 — gün başı anchor: yavaş, kalıcı bleed
-    OI_ANCHOR_PCT = st['oi_anchor_pct']
-    PRICE_ANCHOR_PCT = st['price_anchor_pct']
-    anchor_oi_up = anchor_oi_down = anchor_price_up = anchor_price_down = False
-    if len(df_today) >= 1:
-        anchor_oi, anchor_price = df_today['oi_btc'].iloc[0], df_today['price'].iloc[0]
-        oi_chg = (current_oi - anchor_oi) / anchor_oi * 100
-        price_chg = (current_price - anchor_price) / anchor_price * 100
-        anchor_oi_up = oi_chg > OI_ANCHOR_PCT
-        anchor_oi_down = oi_chg < -OI_ANCHOR_PCT
-        anchor_price_up = price_chg > PRICE_ANCHOR_PCT
-        anchor_price_down = price_chg < -PRICE_ANCHOR_PCT
-
-    if len(df_today) < 3:
-        oi_status = "Veri Bekleniyor"
-        price_status = "Veri Bekleniyor"
-    else:
-        if short_oi_up or mid_oi_up or anchor_oi_up: oi_status = "Artıyor"
-        elif short_oi_down or mid_oi_down or anchor_oi_down: oi_status = "Düşüyor"
-        else: oi_status = "Nötr"
-
-        if short_price_up or mid_price_up or anchor_price_up: price_status = "Artıyor"
-        elif short_price_down or mid_price_down or anchor_price_down: price_status = "Düşüyor"
-        else: price_status = "Nötr"
-
-    return fund_status, oi_status, price_status
+def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
+    """Mum/pencere DEĞİL — 'şu an, N periyot önceki tek noktaya göre ne durumda' mantığı.
+    df_veri kronolojik sıralı olmalı (load_history zaten öyle döndürüyor). N periyot
+    öncesi = df_veri'nin sondan N'inci satırı (15dk aralıkla, 1sa için N=4, 4sa için N=16 vb.)."""
+    if len(df_veri) < periods:
+        return "Veri Bekleniyor"
+    ref = df_veri[kolon].iloc[-periods]
+    if not ref:
+        return "Veri Bekleniyor"
+    degisim_pct = (mevcut_deger - ref) / ref * 100
+    if degisim_pct > esik_pct:
+        return "Artıyor"
+    elif degisim_pct < -esik_pct:
+        return "Düşüyor"
+    return "Nötr"
 
 def cvd_durumu(cvd_spot, cvd_perp):
     """Spot ve perp CVD'nin yönünü karşılaştırıp diverjans olup olmadığını etiketler.
@@ -588,15 +472,106 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     # Fonlama Nötr Pozitif veya Nötr Negatif ise herhangi bir tasfiye setup'ı aranmaz
     return "İşlem Açma"
 
+def _islem_yonu(genel_durum_deger):
+    """Sinyalin ima ettiği yön: fiyatın düşmesini bekleyen sinyaller (Trap/Squeeze
+    'aşağı' türleri) short, yükselmesini bekleyenler long kabul edilir. Absorption/
+    dağıtım gibi yönü belirsiz olanlar için None döner."""
+    long_sinyaller = {"Sağlıklı Long (Squeeze + Organik Talep)", "Short Squeeze (Zayıf Temel)", "Short Trap (Devam Riski)"}
+    short_sinyaller = {"Sağlıklı Short (Squeeze + Organik Satış)", "Long Squeeze (Zayıf Temel)", "Long Trap (Devam Riski)"}
+    if genel_durum_deger in long_sinyaller:
+        return 'long'
+    if genel_durum_deger in short_sinyaller:
+        return 'short'
+    return None
+
+def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str):
+    """'Sanal işlem' takibi — artık HER TIMEFRAME için ayrı ayrı çalışır (tf parametresi
+    aktif_islem_{tf} / sinyal_{tf} tablolarını seçer). genel_durum 'İşlem Açma' dışına
+    çıktığında o andaki fiyat giriş kabul edilir. Sonraki kayıtlar aktif duruma eşitse
+    sayaç sıfırlanır (hâlâ aynı sinyal). Aktif durumdan 3 kez ÜST ÜSTE farklı bir şey
+    gelirse (gürültüye karşı tampon), 3. kayıttaki fiyat çıkış kabul edilip yöne göre
+    (long/short) % kâr hesaplanıp sinyal_{tf} tablosuna yazılır. Kapanışa sebep olan
+    kayıt kendisi de bir sinyalse, yeni takip hemen oradan zincirlenerek başlar.
+    Takip SQLite'ta tutulduğu için script yeniden başlasa bile kaybolmaz."""
+    row = conn.execute(f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac FROM aktif_islem_{tf} WHERE id=1").fetchone()
+
+    def durumu_kaydet(aktif, sayac):
+        conn.execute(f"DELETE FROM aktif_islem_{tf} WHERE id=1")
+        if aktif is not None:
+            conn.execute(
+                f"INSERT INTO aktif_islem_{tf} (id, genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac) VALUES (1,?,?,?,?,?)",
+                (aktif['genel_durum'], aktif['giris_fiyat'], aktif['giris_tarih'], aktif['giris_saat'], sayac)
+            )
+
+    def yeni_baslat(gd):
+        return {'genel_durum': gd, 'giris_fiyat': price, 'giris_tarih': tarih_str, 'giris_saat': saat_str}
+
+    if row is None:
+        if not genel_durum_deger.startswith("İşlem Açma"):
+            durumu_kaydet(yeni_baslat(genel_durum_deger), 0)
+        return None
+
+    aktif = {'genel_durum': row[0], 'giris_fiyat': row[1], 'giris_tarih': row[2], 'giris_saat': row[3]}
+    sayac = row[4]
+
+    if genel_durum_deger == aktif['genel_durum']:
+        durumu_kaydet(aktif, 0)
+        return None
+
+    sayac += 1
+    if sayac < 3:
+        durumu_kaydet(aktif, sayac)
+        return None
+
+    giris_fiyat = aktif['giris_fiyat']
+    yon = _islem_yonu(aktif['genel_durum'])
+    ham_degisim = (price - giris_fiyat) / giris_fiyat * 100
+    kar_yuzde = -ham_degisim if yon == 'short' else ham_degisim
+
+    kapanan = {
+        'kapanis_tarih': tarih_str, 'kapanis_saat': saat_str,
+        'sinyal': aktif['genel_durum'], 'yon': yon or 'belirsiz',
+        'giris_tarih': aktif['giris_tarih'], 'giris_saat': aktif['giris_saat'],
+        'giris_fiyat': giris_fiyat, 'cikis_fiyat': price, 'kar_yuzde': kar_yuzde
+    }
+    conn.execute(
+        f"INSERT INTO sinyal_{tf} (kapanis_tarih, kapanis_saat, sinyal, yon, giris_tarih, giris_saat, giris_fiyat, cikis_fiyat, kar_yuzde) VALUES (?,?,?,?,?,?,?,?,?)",
+        (kapanan['kapanis_tarih'], kapanan['kapanis_saat'], kapanan['sinyal'], kapanan['yon'],
+         kapanan['giris_tarih'], kapanan['giris_saat'], kapanan['giris_fiyat'], kapanan['cikis_fiyat'], kapanan['kar_yuzde'])
+    )
+
+    if not genel_durum_deger.startswith("İşlem Açma"):
+        durumu_kaydet(yeni_baslat(genel_durum_deger), 0)
+    else:
+        durumu_kaydet(None, 0)
+
+    return kapanan
+
+def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):
+    """CVD gün başından (UTC 00:00) itibaren kümülatif bir sayaç olduğu için, referans
+    noktası HER ZAMAN bugünün içinde kalmalı — düne taşarsa sayacın sıfırlandığı noktayı
+    geçmiş oluruz, anlamsız bir sıçrama görürüz. Ama tam N periyot şartını da katı
+    tutmuyoruz: N periyot öncesi bugünün dışına düşüyorsa (örn. gün henüz 24sa'lık
+    veri biriktirmemişse), bunun yerine BUGÜNÜN İLK kaydını referans alırız — 'tam 24
+    saat' değil 'bugün elimizde ne kadarı varsa o kadarı' mantığı. Gün ilerledikçe bu
+    otomatik olarak gerçek ~24 saatlik farka yakınsar."""
+    bugun_df = df_veri[df_veri['tarih'] == tarih_str]
+    if bugun_df.empty:
+        return None, None  # bugün henüz hiç kayıt yok
+
+    if len(df_veri) >= periods and df_veri.iloc[-periods]['tarih'] == tarih_str:
+        ref = df_veri.iloc[-periods]
+    else:
+        ref = bugun_df.iloc[0]  # tam N periyot bugünün dışına taşıyor -> bugünün ilk kaydına düş
+
+    return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
+
 def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
     oi_usd = oi * price
     funding = float(funding)
-    
-    df_history = load_history(path)
-    fund_status, oi_status, price_status = compute_signals(df_history, oi, funding, price)
-    cvd_status = cvd_durumu(cvd_spot, cvd_perp)
-    genel = genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp)
+
+    df_gecmis = load_history(path)  # sadece 'veri' tablosu — her tf kendi periyodu kadar geriye bakacak
 
     row_data = {
         'tarih': now.strftime('%d.%m.%Y'),
@@ -607,37 +582,63 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
         'price': price,
         'cvd_spot_btc': cvd_spot,
         'cvd_perp_btc': cvd_perp,
-        'funding_durum': fund_status,
-        'oi_durum': oi_status,
-        'fiyat_durum': price_status,
-        'cvd_durum': cvd_status,
-        'genel_durum': genel
     }
-    
-    # Yeni satırı mevcut dataframe'e ekle ve tamamını Excel'e bas (Başlık sorunu yaşanmaması için pandas kullanıyoruz)
-    new_row_df = pd.DataFrame([row_data])
-    
-    # Yalnızca timestamp hariç sütunları kaydet
-    save_cols = [c for c in df_history.columns if c != 'timestamp']
-    df_to_save = pd.concat([df_history[save_cols], new_row_df], ignore_index=True)
-    
-    # Excel'e yaz
-    df_to_save.to_excel(path, index=False, engine='openpyxl')
-    wb = load_workbook(path)
-    ws = wb.active
-    for row in ws.iter_rows(min_row=2, min_col=FUNDING_COL, max_col=FUNDING_COL, max_row=ws.max_row):
-        row[0].number_format = '0.0000'
-    wb.save(path)
-    wb.close()
-    
-    print(f"\n🎯 ANLIK SİNYAL DURUMU")
-    print(f"  Fiyat Durumu   : {price_status}")
-    print(f"  OI Durumu      : {oi_status}")
-    print(f"  Funding Durumu : {fund_status}")
-    print(f"  CVD Durumu     : {cvd_status}")
-    print(f"  🧭 GENEL DURUM : {genel}")
-    
-    return pd.DataFrame([row_data])
+
+    fund_status = funding_status(funding)
+
+    conn = sqlite3.connect(path, timeout=30)  # dosya anlık kilitliyse (örn. DB Browser açıksa) 30sn'ye kadar bekler
+    _init_db(conn)
+
+    cur = conn.execute(
+        f"INSERT INTO veri ({','.join(VERI_COLS)}) VALUES ({','.join(['?']*len(VERI_COLS))})",
+        tuple(row_data[c] for c in VERI_COLS)
+    )
+    yeni_id = cur.lastrowid
+    tarih_str, saat_str = row_data['tarih'], row_data['saat']
+
+    tf_sonuclari = {}
+    kapanan_islemler = {}
+
+    for tf, tf_conf in CONFIG['timeframes'].items():
+        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], tf_conf['oi_pct'], 'oi_btc')
+        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], tf_conf['price_pct'], 'price')
+        cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
+
+        if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
+            genel = "Veri Bekleniyor"
+            cvd_durum_tf = "Veri Bekleniyor"
+        else:
+            cvd_durum_tf = cvd_durumu(cvd_spot_delta, cvd_perp_delta)
+            genel = genel_durum(fund_status, oi_durum, fiyat_durum, cvd_spot_delta, cvd_perp_delta)
+
+        conn.execute(
+            f"INSERT INTO durum_{tf} (id, tarih, saat, funding_durum, oi_durum, fiyat_durum, cvd_durum, genel_durum) VALUES (?,?,?,?,?,?,?,?)",
+            (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel)
+        )
+
+        tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf, 'genel_durum': genel}
+
+        if genel != "Veri Bekleniyor":
+            kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str)
+            if kapanan:
+                kapanan_islemler[tf] = kapanan
+
+    conn.commit()
+    conn.close()
+
+    print(f"\n🎯 ANLIK SİNYAL DURUMU (timeframe bazlı)")
+    print(f"  Funding Durumu : {fund_status}   |   Gün içi toplam CVD -> Spot:{cvd_spot:+.2f} Perp:{cvd_perp:+.2f}")
+    for tf in CONFIG['timeframes'].keys():
+        s = tf_sonuclari[tf]
+        print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
+    for tf, k in kapanan_islemler.items():
+        print(f"  💰 [{tf}] SİNYAL KAPANDI: {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
+
+    return {
+        'tarih': tarih_str, 'saat': saat_str, 'oi_btc': oi, 'price': price,
+        'funding_durum': fund_status,
+        'tf_sonuclari': tf_sonuclari, 'kapanan_islemler': kapanan_islemler
+    }
 
 def compute_trend(df, hours):
     if df.empty: return None
@@ -669,7 +670,15 @@ def print_trend_report(df):
 
 def run_snapshot_and_report():
     total_oi, global_funding, failed_borsalar = get_global_macro_data()
+
+    if failed_borsalar:
+        print(f"  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — veri alınamayan borsa(lar): {', '.join(failed_borsalar)}")
+        return None
+
     price = get_btc_price()
+    if price <= 0:
+        print("  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — fiyat verisi alınamadı.")
+        return None
     
     # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
@@ -679,27 +688,47 @@ def run_snapshot_and_report():
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
     
-    snap_df = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
+    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
 
-    report_text = build_telegram_report(failed_borsalar, total_oi, global_funding, cvd_spot, cvd_perp, snap_df.iloc[0])
-    if should_send_telegram():
+    report_text = build_telegram_report(
+        failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
+        sonuc['funding_durum'], sonuc['tf_sonuclari'], sonuc['kapanan_islemler']
+    )
+    if should_send_telegram(sonuc['tf_sonuclari']):
         send_telegram_message(report_text)
     else:
-        print("  ⏳ Telegram mesajı bu saat penceresinde zaten gönderildi, atlanıyor.")
+        print("  ⏳ Hiçbir timeframe'de yeni sinyal yok, Telegram mesajı atlanıyor.")
 
     df = load_history()
     print_trend_report(df)
     return df
 
+def _sonraki_sinira_kadar_bekle(interval_minutes):
+    """Sabit dakika sıfırlarına (örn. 15dk için :00/:15/:30/:45) göre bekler —
+    time.sleep(interval*60) kullanmıyoruz çünkü her turun işlem süresi (API çağrıları
+    vb.) birikip zamanla saatten kaymaya sebep olur. Bu fonksiyon her seferinde
+    GERÇEK saate göre yeniden hesaplar, drift birikmez."""
+    simdi = datetime.now(timezone(timedelta(hours=3)))
+    gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
+    gecen_dakika = (simdi - gun_baslangic).total_seconds() / 60
+    sonraki_dakika = (int(gecen_dakika // interval_minutes) + 1) * interval_minutes
+    sonraki = gun_baslangic + timedelta(minutes=sonraki_dakika)
+    bekleme_saniye = (sonraki - simdi).total_seconds()
+    print(f"[{simdi.strftime('%H:%M:%S')}] Sonraki çalışma tam {sonraki.strftime('%H:%M:%S')}'de (~{bekleme_saniye/60:.1f} dk sonra)\n")
+    time.sleep(max(bekleme_saniye, 0))
+
 def run_continuous(interval_minutes=15):
-    print(f"Başlatılıyor: Her {interval_minutes} dakikada bir snapshot çalıştırılacak.")
+    print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
     while True:
+        _sonraki_sinira_kadar_bekle(interval_minutes)
         try:
             run_snapshot_and_report()
         except Exception as e:
             print(f"  ❌ Beklenmeyen hata: {e}")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Sonraki çalışma {interval_minutes} dakikada başlayacak...\n")
-        time.sleep(interval_minutes * 60)
+            try:
+                send_telegram_message(f"⚠️ <b>Bot hata verdi, bu tur kaydedilemedi:</b>\n{str(e)[:300]}")
+            except Exception:
+                pass  # Telegram'ın kendisi de başarısız olursa döngüyü yine de durdurmayalım
 
 if __name__ == "__main__":
     run_continuous(15)
