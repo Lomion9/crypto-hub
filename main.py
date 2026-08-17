@@ -16,15 +16,22 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 DEFAULT_CONFIG = {
     "timeframes": {
-        "15dk": {"periods": 1, "oi_pct": 0.31, "price_pct": 0.22},
-        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43},
-        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72},
-        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08},
-        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36},
-        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76}
+        "15dk": {"periods": 1, "oi_pct": 0.31, "price_pct": 0.22, "kapanis_esigi": 3, "sinir_saatleri": None},
+        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43, "kapanis_esigi": 1, "sinir_saatleri": list(range(24))},
+        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72, "kapanis_esigi": 1, "sinir_saatleri": [1,3,5,7,9,11,13,15,17,19,21,23]},
+        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08, "kapanis_esigi": 1, "sinir_saatleri": [23,3,7,11,15,19]},
+        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36, "kapanis_esigi": 1, "sinir_saatleri": [3,11,19]},
+        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76, "kapanis_esigi": 1, "sinir_saatleri": [3]}
     },
     "funding_thresholds": {
         "extreme_pct": 0.0030
+    },
+    "adaptive": {
+        "enabled": True,
+        "lookback_days": 7,
+        "min_days_required": 3,
+        "noise_percentile": 90,
+        "multiplier": 1.1
     },
     "telegram": {
         "min_interval_minutes": 60
@@ -32,10 +39,6 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    """config.json varsa oradan okur; yoksa (ilk çalıştırma) varsayılan değerlerle
-    dosyayı kendisi oluşturur. Eşikleri değiştirmek için artık kod açmana gerek yok —
-    sadece config.json içindeki sayıyı değiştirip kaydetmen yeterli (script'i yeniden
-    başlattığında yeni değerler devreye girer)."""
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -67,11 +70,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
-    """tf_sonuclari: {tf: {'genel_durum': ..., ...}}. Herhangi bir timeframe'in
-    genel_durum'u 'İşlem Açma' (veya henüz 'Veri Bekleniyor') DIŞINDA bir şey
-    gösterip kendi son gönderilen durumundan FARKLIYSA True döner — o an TÜM
-    timeframe'lerin durumu tek mesajda özetlenip gönderilir. Her timeframe kendi
-    değişimini bağımsız takip eder, birinin flicker'ı diğerini etkilemez."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
@@ -484,12 +482,13 @@ def _islem_yonu(genel_durum_deger):
         return 'short'
     return None
 
-def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str):
+def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3):
     """'Sanal işlem' takibi — artık HER TIMEFRAME için ayrı ayrı çalışır (tf parametresi
     aktif_islem_{tf} / sinyal_{tf} tablolarını seçer). genel_durum 'İşlem Açma' dışına
     çıktığında o andaki fiyat giriş kabul edilir. Sonraki kayıtlar aktif duruma eşitse
-    sayaç sıfırlanır (hâlâ aynı sinyal). Aktif durumdan 3 kez ÜST ÜSTE farklı bir şey
-    gelirse (gürültüye karşı tampon), 3. kayıttaki fiyat çıkış kabul edilip yöne göre
+    sayaç sıfırlanır (hâlâ aynı sinyal). Aktif durumdan kapanis_esigi kadar ÜST ÜSTE
+    farklı bir şey gelirse (kısa vadede gürültüye karşı tampon, uzun vadede genelde 1 —
+    ilk farklı kayıtta hemen kapanır), o kayıttaki fiyat çıkış kabul edilip yöne göre
     (long/short) % kâr hesaplanıp sinyal_{tf} tablosuna yazılır. Kapanışa sebep olan
     kayıt kendisi de bir sinyalse, yeni takip hemen oradan zincirlenerek başlar.
     Takip SQLite'ta tutulduğu için script yeniden başlasa bile kaybolmaz."""
@@ -519,7 +518,7 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
         return None
 
     sayac += 1
-    if sayac < 3:
+    if sayac < kapanis_esigi:
         durumu_kaydet(aktif, sayac)
         return None
 
@@ -566,6 +565,43 @@ def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, 
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
+def compute_adaptive_tf_thresholds(df_veri):
+    """Sabit eşikler yerine, elimizdeki TÜM geçmiş veriden (df_veri) her timeframe'in
+    gerçek N-periyotluk % değişim dağılımını ölçüp eşiği otomatik ayarlar — 14/15.08
+    verisinden elle yaptığımız kalibrasyonun (90. persentil x 1.1 çarpan) sürekli
+    kendini güncelleyen hali. lookback_days'i aşan eski veri otomatik dışlanır.
+    Yeterli gün yoksa (min_days_required) None döner, çağıran taraf statik
+    config değerlerine (CONFIG['timeframes'][tf]['oi_pct']/['price_pct']) düşer."""
+    ac = CONFIG.get('adaptive', {})
+    if not ac.get('enabled', False):
+        return None
+    if 'tarih' not in df_veri.columns or len(df_veri) == 0:
+        return None
+
+    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
+    if len(gunler) < ac.get('min_days_required', 1):
+        return None
+
+    lookback_gunler = set(gunler[-ac.get('lookback_days', 7):])
+    df = df_veri[df_veri['tarih'].isin(lookback_gunler)]
+
+    p = ac.get('noise_percentile', 90)
+    m = ac.get('multiplier', 1.1)
+
+    sonuc = {}
+    for tf, tf_conf in CONFIG['timeframes'].items():
+        periods = tf_conf['periods']
+        oi_degisimler = (df['oi_btc'].diff(periods).abs() / df['oi_btc'].shift(periods) * 100).dropna()
+        price_degisimler = (df['price'].diff(periods).abs() / df['price'].shift(periods) * 100).dropna()
+        if len(oi_degisimler) < 5:
+            sonuc[tf] = None  # yetersiz ölçüm, bu timeframe statik değerde kalsın
+            continue
+        sonuc[tf] = {
+            'oi_pct': float(np.percentile(oi_degisimler, p)) * m,
+            'price_pct': float(np.percentile(price_degisimler, p)) * m,
+        }
+    return sonuc
+
 def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
     oi_usd = oi * price
@@ -598,10 +634,20 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
 
     tf_sonuclari = {}
     kapanan_islemler = {}
+    adaptif = compute_adaptive_tf_thresholds(df_gecmis)
+    mevcut_saat, mevcut_dakika = now.hour, now.minute
 
     for tf, tf_conf in CONFIG['timeframes'].items():
-        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], tf_conf['oi_pct'], 'oi_btc')
-        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], tf_conf['price_pct'], 'price')
+        sinir_saatleri = tf_conf.get('sinir_saatleri')
+        if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
+            continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
+
+        tf_adaptif = adaptif.get(tf) if adaptif else None
+        oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
+        price_esik = tf_adaptif['price_pct'] if tf_adaptif else tf_conf['price_pct']
+
+        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], oi_esik, 'oi_btc')
+        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], price_esik, 'price')
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
 
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
@@ -619,7 +665,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
         tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf, 'genel_durum': genel}
 
         if genel != "Veri Bekleniyor":
-            kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str)
+            kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str, tf_conf.get('kapanis_esigi', 3))
             if kapanan:
                 kapanan_islemler[tf] = kapanan
 
@@ -629,6 +675,8 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     print(f"\n🎯 ANLIK SİNYAL DURUMU (timeframe bazlı)")
     print(f"  Funding Durumu : {fund_status}   |   Gün içi toplam CVD -> Spot:{cvd_spot:+.2f} Perp:{cvd_perp:+.2f}")
     for tf in CONFIG['timeframes'].keys():
+        if tf not in tf_sonuclari:
+            continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
     for tf, k in kapanan_islemler.items():
@@ -704,10 +752,6 @@ def run_snapshot_and_report():
     return df
 
 def _sonraki_sinira_kadar_bekle(interval_minutes):
-    """Sabit dakika sıfırlarına (örn. 15dk için :00/:15/:30/:45) göre bekler —
-    time.sleep(interval*60) kullanmıyoruz çünkü her turun işlem süresi (API çağrıları
-    vb.) birikip zamanla saatten kaymaya sebep olur. Bu fonksiyon her seferinde
-    GERÇEK saate göre yeniden hesaplar, drift birikmez."""
     simdi = datetime.now(timezone(timedelta(hours=3)))
     gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
     gecen_dakika = (simdi - gun_baslangic).total_seconds() / 60
