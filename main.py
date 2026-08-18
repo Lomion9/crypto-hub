@@ -17,21 +17,14 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULT_CONFIG = {
     "timeframes": {
         "15dk": {"periods": 1, "oi_pct": 0.31, "price_pct": 0.22, "kapanis_esigi": 3, "sinir_saatleri": None},
-        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43, "kapanis_esigi": 1, "sinir_saatleri": list(range(24))},
-        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72, "kapanis_esigi": 1, "sinir_saatleri": [1,3,5,7,9,11,13,15,17,19,21,23]},
-        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08, "kapanis_esigi": 1, "sinir_saatleri": [23,3,7,11,15,19]},
-        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36, "kapanis_esigi": 1, "sinir_saatleri": [3,11,19]},
-        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76, "kapanis_esigi": 1, "sinir_saatleri": [3]}
+        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43, "kapanis_esigi": 1, "sinir_saatleri": list(range(24)), "confirm_kaynak": "15dk", "confirm_n": 4},
+        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72, "kapanis_esigi": 1, "sinir_saatleri": [1,3,5,7,9,11,13,15,17,19,21,23], "confirm_kaynak": "15dk", "confirm_n": 8},
+        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08, "kapanis_esigi": 1, "sinir_saatleri": [23,3,7,11,15,19], "confirm_kaynak": "1sa", "confirm_n": 4},
+        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36, "kapanis_esigi": 1, "sinir_saatleri": [3,11,19], "confirm_kaynak": "1sa", "confirm_n": 8},
+        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76, "kapanis_esigi": 1, "sinir_saatleri": [3], "confirm_kaynak": "4sa", "confirm_n": 6}
     },
     "funding_thresholds": {
         "extreme_pct": 0.0030
-    },
-    "adaptive": {
-        "enabled": True,
-        "lookback_days": 7,
-        "min_days_required": 3,
-        "noise_percentile": 90,
-        "multiplier": 1.1
     },
     "telegram": {
         "min_interval_minutes": 60
@@ -41,7 +34,7 @@ DEFAULT_CONFIG = {
         "interval_seconds": 30
     },
     "huobi": {
-        "delay_seconds": 30
+        "delay_seconds": 50
     }
 }
 
@@ -81,11 +74,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
-    """tf_sonuclari: {tf: {'genel_durum': ..., ...}}. Herhangi bir timeframe'in
-    genel_durum'u 'İşlem Açma' (veya henüz 'Veri Bekleniyor') DIŞINDA bir şey
-    gösterip kendi son gönderilen durumundan FARKLIYSA True döner — o an TÜM
-    timeframe'lerin durumu tek mesajda özetlenip gönderilir. Her timeframe kendi
-    değişimini bağımsız takip eder, birinin flicker'ı diğerini etkilemez."""
+    """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., ...}}.
+    Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri Bekleniyor' DIŞINDA bir şey
+    gösterip kendi son gönderilen durumundan FARKLI OLDUĞUNDA VE 'telegram_uygun'
+    (konfirmasyon şartı — bkz. log_snapshot/son_tf_genel_durumlar) sağlandığında
+    True döner. 15dk'nın telegram_uygun'u her zaman False'tur, yani 15dk hiçbir
+    zaman tek başına mesaj tetiklemez.
+
+    ÖNEMLİ: bir değişiklik farkedilip henüz KONFİRME OLMADIYSA, _LAST_TELEGRAM_DURUMLAR
+    GÜNCELLENMEZ — böylece bir sonraki turda konfirmasyon sağlanırsa (aynı genel_durum
+    hâlâ geçerliyken) hâlâ 'yeni' sayılıp gönderilir. Sadece FİİLEN gönderilen (ya da
+    'İşlem Açma'/'Veri Bekleniyor' gibi nötr) durumlar son-gönderilen state'i günceller."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
@@ -95,8 +94,10 @@ def should_send_telegram(tf_sonuclari):
             _LAST_TELEGRAM_DURUMLAR[tf] = gd
             continue
         if gd != onceki:
-            gonder = True
-        _LAST_TELEGRAM_DURUMLAR[tf] = gd
+            if sonuc.get('telegram_uygun'):
+                gonder = True
+                _LAST_TELEGRAM_DURUMLAR[tf] = gd
+            # konfirme olmadıysa onceki'yi güncelleme: değişiklik "beklemede" kalsın
     return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
@@ -420,21 +421,36 @@ def funding_status(current_funding):
         return "Negatif"
     return "Nötr"
 
-def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
-    """Mum/pencere DEĞİL — 'şu an, N periyot önceki tek noktaya göre ne durumda' mantığı.
-    df_veri kronolojik sıralı olmalı (load_history zaten öyle döndürüyor). N periyot
-    öncesi = df_veri'nin sondan N'inci satırı (15dk aralıkla, 1sa için N=4, 4sa için N=16 vb.)."""
+def _periyot_durumu(df_veri, mevcut_deger, periods, kolon):
+    """ROLLING-MIN / ROLLING-MAX YÖN mantığı — EŞİKSİZ (ne statik ne adaptive).
+    'Şu an, son N periyotluk pencerenin DİBİNE mi daha yakın (Artıyor), TEPESİNE mi
+    daha yakın (Düşüyor)' — hangi mesafe büyükse o yön kazanır. Sabit bir yüzde
+    eşiği yok; bu artık sadece YÖN belirliyor.
+
+    Gerçek 'bu sinyal ciddiye alınsın mı' filtresi burada değil, Telegram gönderim
+    aşamasında: bir üst timeframe'in genel_durum'u, kendi confirm_kaynak tf'inden
+    son confirm_n adet genel_durum kaydından en az biriyle birebir örtüşmüyorsa
+    mesaj gönderilmiyor (bkz. son_tf_genel_durumlar / should_send_telegram)."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
-    ref = df_veri[kolon].iloc[-periods]
-    if not ref:
+    pencere = df_veri[kolon].iloc[-periods:]
+    if pencere.isna().any() or (pencere <= 0).any() or not mevcut_deger:
         return "Veri Bekleniyor"
-    degisim_pct = (mevcut_deger - ref) / ref * 100
-    if degisim_pct > esik_pct:
-        return "Artıyor"
-    elif degisim_pct < -esik_pct:
-        return "Düşüyor"
-    return "Nötr"
+
+    pencere_min = pencere.min()
+    pencere_max = pencere.max()
+    artis_pct = (mevcut_deger - pencere_min) / pencere_min * 100
+    dusus_pct = (pencere_max - mevcut_deger) / pencere_max * 100
+    return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
+
+def son_tf_genel_durumlar(conn, kaynak_tf, n):
+    """Şu ana kadar (bu turda kaynak_tf için yeni bir kayıt yazıldıysa o da dahil —
+    aynı bağlantıda commit beklemeden görünür) yazılmış son n adet
+    durum_{kaynak_tf}.genel_durum değerini, en yeniden en eskiye döndürür."""
+    rows = conn.execute(
+        f"SELECT genel_durum FROM durum_{kaynak_tf} ORDER BY id DESC LIMIT ?", (n,)
+    ).fetchall()
+    return [r[0] for r in rows]
 
 def cvd_durumu(cvd_spot, cvd_perp):
     """Spot ve perp CVD'nin yönünü karşılaştırıp diverjans olup olmadığını etiketler.
@@ -592,43 +608,6 @@ def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, 
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
-def compute_adaptive_tf_thresholds(df_veri):
-    """Sabit eşikler yerine, elimizdeki TÜM geçmiş veriden (df_veri) her timeframe'in
-    gerçek N-periyotluk % değişim dağılımını ölçüp eşiği otomatik ayarlar — 14/15.08
-    verisinden elle yaptığımız kalibrasyonun (90. persentil x 1.1 çarpan) sürekli
-    kendini güncelleyen hali. lookback_days'i aşan eski veri otomatik dışlanır.
-    Yeterli gün yoksa (min_days_required) None döner, çağıran taraf statik
-    config değerlerine (CONFIG['timeframes'][tf]['oi_pct']/['price_pct']) düşer."""
-    ac = CONFIG.get('adaptive', {})
-    if not ac.get('enabled', False):
-        return None
-    if 'tarih' not in df_veri.columns or len(df_veri) == 0:
-        return None
-
-    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
-    if len(gunler) < ac.get('min_days_required', 1):
-        return None
-
-    lookback_gunler = set(gunler[-ac.get('lookback_days', 7):])
-    df = df_veri[df_veri['tarih'].isin(lookback_gunler)]
-
-    p = ac.get('noise_percentile', 90)
-    m = ac.get('multiplier', 1.1)
-
-    sonuc = {}
-    for tf, tf_conf in CONFIG['timeframes'].items():
-        periods = tf_conf['periods']
-        oi_degisimler = (df['oi_btc'].diff(periods).abs() / df['oi_btc'].shift(periods) * 100).dropna()
-        price_degisimler = (df['price'].diff(periods).abs() / df['price'].shift(periods) * 100).dropna()
-        if len(oi_degisimler) < 5:
-            sonuc[tf] = None  # yetersiz ölçüm, bu timeframe statik değerde kalsın
-            continue
-        sonuc[tf] = {
-            'oi_pct': float(np.percentile(oi_degisimler, p)) * m,
-            'price_pct': float(np.percentile(price_degisimler, p)) * m,
-        }
-    return sonuc
-
 def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
     oi_usd = oi * price
@@ -661,7 +640,6 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
 
     tf_sonuclari = {}
     kapanan_islemler = {}
-    adaptif = compute_adaptive_tf_thresholds(df_gecmis)
     mevcut_saat, mevcut_dakika = now.hour, now.minute
 
     for tf, tf_conf in CONFIG['timeframes'].items():
@@ -669,12 +647,8 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
             continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
 
-        tf_adaptif = adaptif.get(tf) if adaptif else None
-        oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
-        price_esik = tf_adaptif['price_pct'] if tf_adaptif else tf_conf['price_pct']
-
-        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], oi_esik, 'oi_btc')
-        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], price_esik, 'price')
+        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], 'oi_btc')
+        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], 'price')
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
 
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
@@ -689,7 +663,26 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
             (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel)
         )
 
-        tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf, 'genel_durum': genel}
+        # TELEGRAM KONFİRMASYON ŞARTI: 15dk kendi sinyalini asla doğrudan Telegram'a
+        # göndermez (telegram_uygun=False sabit). Diğer tf'ler için: kendi
+        # confirm_kaynak tf'inden son confirm_n adet genel_durum kaydından (bu
+        # turda kaynak tf için yeni yazılan kayıt varsa o da dahil) en az biri, BU
+        # tf'in genel_durum'uyla birebir aynı olmalı — yoksa mesaj atlanır (ama
+        # durum_{tf} tablosuna ve genel akışa normal şekilde yazılmaya devam eder).
+        # Zincir: 1sa/2sa -> son 4/8 adet 15dk durumu, 4sa/8sa -> son 4/8 adet 1sa
+        # durumu, 24sa -> son 6 adet 4sa durumu.
+        if tf == '15dk':
+            telegram_uygun = False
+        elif genel == "Veri Bekleniyor":
+            telegram_uygun = False
+        else:
+            kaynak_tf = tf_conf['confirm_kaynak']
+            kaynak_n = tf_conf['confirm_n']
+            son_durumlar = son_tf_genel_durumlar(conn, kaynak_tf, kaynak_n)
+            telegram_uygun = genel in son_durumlar
+
+        tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf,
+                             'genel_durum': genel, 'telegram_uygun': telegram_uygun}
 
         if genel != "Veri Bekleniyor":
             kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str, tf_conf.get('kapanis_esigi', 3))
