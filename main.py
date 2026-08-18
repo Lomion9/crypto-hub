@@ -35,10 +35,21 @@ DEFAULT_CONFIG = {
     },
     "telegram": {
         "min_interval_minutes": 60
+    },
+    "debug": {
+        "enabled": False,
+        "interval_seconds": 30
+    },
+    "huobi": {
+        "delay_seconds": 30
     }
 }
 
 def load_config():
+    """config.json varsa oradan okur; yoksa (ilk çalıştırma) varsayılan değerlerle
+    dosyayı kendisi oluşturur. Eşikleri değiştirmek için artık kod açmana gerek yok —
+    sadece config.json içindeki sayıyı değiştirip kaydetmen yeterli (script'i yeniden
+    başlattığında yeni değerler devreye girer)."""
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -70,6 +81,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
+    """tf_sonuclari: {tf: {'genel_durum': ..., ...}}. Herhangi bir timeframe'in
+    genel_durum'u 'İşlem Açma' (veya henüz 'Veri Bekleniyor') DIŞINDA bir şey
+    gösterip kendi son gönderilen durumundan FARKLIYSA True döner — o an TÜM
+    timeframe'lerin durumu tek mesajda özetlenip gönderilir. Her timeframe kendi
+    değişimini bağımsız takip eder, birinin flicker'ı diğerini etkilemez."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
@@ -285,10 +301,21 @@ def get_global_macro_data():
         'Bybit_USD': fetch_with_retry(get_custom_bybit_data, category='inverse', symbol='BTCUSD'),
         'OKX_USDT': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USDT:USDT'),
         'OKX_USD': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USD:BTC'),
-        'Huobi_USDT': fetch_with_retry(get_custom_huobi_data, category='linear'),
-        'Huobi_USD': fetch_with_retry(get_custom_huobi_data, category='inverse'),
         'Hyperliquid': fetch_with_retry(get_custom_hyperliquid_data)
     }
+
+    # Huobi/HTX: diğer borsalarla aynı anda (dakika sınırında herkesin isteği
+    # aynı saniyeye denk geldiği "izdiham" anında) çağrılmıyor — kısa bir süre
+    # bekleyip trafiğin sakinleştiği bir ana kaydırıyoruz. Süre config.json ->
+    # huobi.delay_seconds ile ayarlanabilir (debug modunda hızlıca test etmek
+    # istersen 0'a çekebilirsin).
+    huobi_delay = CONFIG.get('huobi', {}).get('delay_seconds', 30)
+    if huobi_delay > 0:
+        print(f"  ⏳ Huobi çağrılarından önce {huobi_delay}sn bekleniyor (dakika sınırı izdihamından kaçınmak için)...")
+        time.sleep(huobi_delay)
+
+    markets['Huobi_USDT'] = fetch_with_retry(get_custom_huobi_data, category='linear')
+    markets['Huobi_USD'] = fetch_with_retry(get_custom_huobi_data, category='inverse')
     
     hl_funding_8h_real = get_hyperliquid_funding_8h_real('BTC')
 
@@ -752,6 +779,10 @@ def run_snapshot_and_report():
     return df
 
 def _sonraki_sinira_kadar_bekle(interval_minutes):
+    """Sabit dakika sıfırlarına (örn. 15dk için :00/:15/:30/:45) göre bekler —
+    time.sleep(interval*60) kullanmıyoruz çünkü her turun işlem süresi (API çağrıları
+    vb.) birikip zamanla saatten kaymaya sebep olur. Bu fonksiyon her seferinde
+    GERÇEK saate göre yeniden hesaplar, drift birikmez."""
     simdi = datetime.now(timezone(timedelta(hours=3)))
     gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
     gecen_dakika = (simdi - gun_baslangic).total_seconds() / 60
@@ -762,9 +793,22 @@ def _sonraki_sinira_kadar_bekle(interval_minutes):
     time.sleep(max(bekleme_saniye, 0))
 
 def run_continuous(interval_minutes=15):
-    print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
+    debug_cfg = CONFIG.get('debug', {})
+    debug_on = debug_cfg.get('enabled', False)
+    debug_interval = debug_cfg.get('interval_seconds', 30)
+
+    if debug_on:
+        print(f"⚠️  DEBUG MODU AKTİF (config.json -> debug.enabled=true): "
+              f":00/:15/:30/:45 sınırı BEKLENMEYECEK, her {debug_interval} saniyede bir "
+              f"snapshot alınacak. Bitince config.json'da debug.enabled'ı false yap.")
+    else:
+        print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
+
     while True:
-        _sonraki_sinira_kadar_bekle(interval_minutes)
+        if debug_on:
+            time.sleep(debug_interval)
+        else:
+            _sonraki_sinira_kadar_bekle(interval_minutes)
         try:
             run_snapshot_and_report()
         except Exception as e:

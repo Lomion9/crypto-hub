@@ -3,38 +3,115 @@
     "15dk": {
       "periods": 1,
       "oi_pct": 0.31,
-      "price_pct": 0.22
+      "price_pct": 0.22,
+      "kapanis_esigi": 3,
+      "sinir_saatleri": null
     },
     "1sa": {
       "periods": 4,
       "oi_pct": 0.88,
-      "price_pct": 0.43
+      "price_pct": 0.43,
+      "kapanis_esigi": 1,
+      "sinir_saatleri": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ]
     },
     "2sa": {
       "periods": 8,
       "oi_pct": 1.65,
-      "price_pct": 0.72
+      "price_pct": 0.72,
+      "kapanis_esigi": 1,
+      "sinir_saatleri": [
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13,
+        15,
+        17,
+        19,
+        21,
+        23
+      ]
     },
     "4sa": {
       "periods": 16,
       "oi_pct": 3.08,
-      "price_pct": 1.08
+      "price_pct": 1.08,
+      "kapanis_esigi": 1,
+      "sinir_saatleri": [
+        23,
+        3,
+        7,
+        11,
+        15,
+        19
+      ]
     },
     "8sa": {
       "periods": 32,
       "oi_pct": 5.1,
-      "price_pct": 1.36
+      "price_pct": 1.36,
+      "kapanis_esigi": 1,
+      "sinir_saatleri": [
+        3,
+        11,
+        19
+      ]
     },
     "24sa": {
       "periods": 96,
       "oi_pct": 7.73,
-      "price_pct": 1.76
+      "price_pct": 1.76,
+      "kapanis_esigi": 1,
+      "sinir_saatleri": [
+        3
+      ]
     }
   },
   "funding_thresholds": {
     "extreme_pct": 0.003
   },
+  "adaptive": {
+    "enabled": true,
+    "lookback_days": 7,
+    "min_days_required": 3,
+    "noise_percentile": 90,
+    "multiplier": 1.1
+  },
   "telegram": {
     "min_interval_minutes": 60
+  },
+  "debug": {
+    "enabled": false,
+    "interval_seconds": 30
+  },
+  "huobi": {
+    "delay_seconds": 30
   }
 }
