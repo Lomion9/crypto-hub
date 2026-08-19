@@ -26,6 +26,12 @@ DEFAULT_CONFIG = {
     "funding_thresholds": {
         "extreme_pct": 0.0030
     },
+    "adaptive": {
+        "enabled": True,
+        "lookback_days": 7,
+        "quiet_days": 3,
+        "noise_percentile": 90
+    },
     "telegram": {
         "min_interval_minutes": 60
     },
@@ -421,16 +427,11 @@ def funding_status(current_funding):
         return "Negatif"
     return "Nötr"
 
-def _periyot_durumu(df_veri, mevcut_deger, periods, kolon):
-    """ROLLING-MIN / ROLLING-MAX YÖN mantığı — EŞİKSİZ (ne statik ne adaptive).
-    'Şu an, son N periyotluk pencerenin DİBİNE mi daha yakın (Artıyor), TEPESİNE mi
-    daha yakın (Düşüyor)' — hangi mesafe büyükse o yön kazanır. Sabit bir yüzde
-    eşiği yok; bu artık sadece YÖN belirliyor.
-
-    Gerçek 'bu sinyal ciddiye alınsın mı' filtresi burada değil, Telegram gönderim
-    aşamasında: bir üst timeframe'in genel_durum'u, kendi confirm_kaynak tf'inden
-    son confirm_n adet genel_durum kaydından en az biriyle birebir örtüşmüyorsa
-    mesaj gönderilmiyor (bkz. son_tf_genel_durumlar / should_send_telegram)."""
+def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
+    """ROLLING-MIN / ROLLING-MAX + EŞİK: son N periyotluk pencerenin dip/tepesine
+    olan mesafelerden büyük olanı esik_pct'yi geçmiyorsa Nötr döner (akümülasyon/
+    dağıtım tespiti Nötr'e ihtiyaç duyar); geçiyorsa hangi mesafe büyükse o yön
+    (Artıyor/Düşüyor) döner."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
     pencere = df_veri[kolon].iloc[-periods:]
@@ -441,21 +442,36 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, kolon):
     pencere_max = pencere.max()
     artis_pct = (mevcut_deger - pencere_min) / pencere_min * 100
     dusus_pct = (pencere_max - mevcut_deger) / pencere_max * 100
+
+    if artis_pct <= esik_pct and dusus_pct <= esik_pct:
+        return "Nötr"
     return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
 
+def _rolling_hareket_mesafesi(seri, periods):
+    """Bir kolon (Series, kronolojik sıralı, POZİSYONEL/0-tabanlı index) için,
+    her geçerli noktada 'son N periyotluk pencerenin dip/tepesine olan en büyük
+    mesafe' değerini (pozisyon, mesafe) çiftleri olarak döndürür — _periyot_durumu
+    ile BİREBİR aynı ölçütle. Pozisyon bilgisi, güne göre gruplamak (adaptive eşik
+    hesabı) için taşınıyor; eksik/geçersiz noktalar listede hiç yer almaz."""
+    sonuc = []
+    for i in range(periods, len(seri)):
+        pencere = seri.iloc[i - periods:i]
+        mevcut = seri.iloc[i]
+        if pencere.isna().any() or (pencere <= 0).any() or not mevcut or mevcut <= 0:
+            continue
+        pmin, pmax = pencere.min(), pencere.max()
+        artis = (mevcut - pmin) / pmin * 100
+        dusus = (pmax - mevcut) / pmax * 100
+        sonuc.append((i, max(artis, dusus)))
+    return sonuc
+
 def son_tf_genel_durumlar(conn, kaynak_tf, n):
-    """Şu ana kadar (bu turda kaynak_tf için yeni bir kayıt yazıldıysa o da dahil —
-    aynı bağlantıda commit beklemeden görünür) yazılmış son n adet
-    durum_{kaynak_tf}.genel_durum değerini, en yeniden en eskiye döndürür."""
     rows = conn.execute(
         f"SELECT genel_durum FROM durum_{kaynak_tf} ORDER BY id DESC LIMIT ?", (n,)
     ).fetchall()
     return [r[0] for r in rows]
 
 def cvd_durumu(cvd_spot, cvd_perp):
-    """Spot ve perp CVD'nin yönünü karşılaştırıp diverjans olup olmadığını etiketler.
-    Aynı yöndeyse baskı 'uyumlu' (spot ve kaldıraç aynı tarafta), zıt yöndeyse 'diverjans'
-    (biri gerçek talebi, diğeri kaldıraç baskısını gösteriyor demektir)."""
     spot_yon = "Long" if cvd_spot > 0 else ("Short" if cvd_spot < 0 else "Nötr")
     perp_yon = "Long" if cvd_perp > 0 else ("Short" if cvd_perp < 0 else "Nötr")
 
@@ -469,15 +485,6 @@ def cvd_durumu(cvd_spot, cvd_perp):
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
-    """
-    Tetikleyici Şartı:
-    Piyasa yapıcıların tasfiye (likidasyon) avına çıkması için fonlamanın
-    'Nötr Pozitif/Negatif' değil, 'Aşırı' seviyelerde olması gerekir.
-
-    Long ve Short taraf simetrik kurulmuştur:
-    - long_trap / short_trap: pozisyon HENÜZ birikiyor, fiyat aleyhte gidiyor (tuzak kuruluyor)
-    - long_squeeze / short_squeeze: pozisyon tasfiye OLUYOR, an itibariyle kapanış baskısı var
-    """
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
@@ -490,51 +497,57 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
 
     if short_squeeze:
-        return "Sağlıklı Long (Squeeze + Organik Talep)" if cvd_spot > 0 else "Short Squeeze (Zayıf Temel)"
+        # NOT: eskiden "Sağlıklı Long (Squeeze + Organik Talep)" döndürülüyordu ama
+        # _islem_yonu tam "Sağlıklı Long" arıyordu -> hiç eşleşmiyordu, bu yüzden
+        # "sağlıklı long" hiç tetiklenmiyormuş gibi görünüyordu. Etiketler artık
+        # _islem_yonu ile birebir aynı (parantezli açıklamalar kaldırıldı).
+        return "Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"
 
     if long_squeeze:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
-        return "Sağlıklı Short (Squeeze + Organik Satış)" if cvd_spot < 0 else "Long Squeeze (Zayıf Temel)"
+        return "Sağlıklı Short" if cvd_spot < 0 else "Long Squeeze"
 
     if long_trap:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
-        return "Long Trap (Devam Riski)"
+        return "Long Trap"
 
     if short_trap:
         dagitim_riski = cvd_spot < 0 and abs(cvd_spot) > abs(cvd_perp)
         if dagitim_riski:
             return "İşlem Açma (Olası Dağıtım - Spot Satış Baskın)"
-        return "Short Trap (Devam Riski)"
+        return "Short Trap"
 
-    # Fonlama Nötr Pozitif veya Nötr Negatif ise herhangi bir tasfiye setup'ı aranmaz
+    # AKÜMÜLASYON / DAĞITIM: fiyat yatay (Nötr) ama OI birikiyor (Artıyor) -> pozisyon
+    # sessizce kuruluyor demektir; yön, hangi tarafın (spot alım mı satım mı) baskın
+    # olduğuna, yani CVD spot'un işaretine ve perp'e göre baskınlığına bakılarak
+    # belirlenir. Bu iki durum funding'in extreme olup olmamasından bağımsızdır --
+    # trap/squeeze koşulları zaten üstte elenmiş olduğu için buraya sadece price_status
+    # Nötr olduğunda düşülür.
+    if price_status == "Nötr" and oi_status == "Artıyor":
+        if cvd_spot > 0 and cvd_spot >= abs(cvd_perp):
+            return "Akümülasyon"
+        if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
+            return "Dağıtım"
+
+    # Fonlama Nötr Pozitif veya Nötr Negatif ise (ya da yukarıdaki hiçbir setup
+    # oluşmadıysa) herhangi bir tasfiye/birikim setup'ı aranmaz
     return "İşlem Açma"
 
 def _islem_yonu(genel_durum_deger):
-    """Sinyalin ima ettiği yön: fiyatın düşmesini bekleyen sinyaller (Trap/Squeeze
-    'aşağı' türleri) short, yükselmesini bekleyenler long kabul edilir. Absorption/
-    dağıtım gibi yönü belirsiz olanlar için None döner."""
-    long_sinyaller = {"Sağlıklı Long (Squeeze + Organik Talep)", "Short Squeeze (Zayıf Temel)", "Short Trap (Devam Riski)"}
-    short_sinyaller = {"Sağlıklı Short (Squeeze + Organik Satış)", "Long Squeeze (Zayıf Temel)", "Long Trap (Devam Riski)"}
+    long_sinyaller = {"Sağlıklı Long", "Short Squeeze", "Short Trap", "Akümülasyon"}
+    short_sinyaller = {"Sağlıklı Short", "Long Squeeze", "Long Trap", "Dağıtım"}
     if genel_durum_deger in long_sinyaller:
         return 'long'
     if genel_durum_deger in short_sinyaller:
         return 'short'
     return None
 
+
 def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3):
-    """'Sanal işlem' takibi — artık HER TIMEFRAME için ayrı ayrı çalışır (tf parametresi
-    aktif_islem_{tf} / sinyal_{tf} tablolarını seçer). genel_durum 'İşlem Açma' dışına
-    çıktığında o andaki fiyat giriş kabul edilir. Sonraki kayıtlar aktif duruma eşitse
-    sayaç sıfırlanır (hâlâ aynı sinyal). Aktif durumdan kapanis_esigi kadar ÜST ÜSTE
-    farklı bir şey gelirse (kısa vadede gürültüye karşı tampon, uzun vadede genelde 1 —
-    ilk farklı kayıtta hemen kapanır), o kayıttaki fiyat çıkış kabul edilip yöne göre
-    (long/short) % kâr hesaplanıp sinyal_{tf} tablosuna yazılır. Kapanışa sebep olan
-    kayıt kendisi de bir sinyalse, yeni takip hemen oradan zincirlenerek başlar.
-    Takip SQLite'ta tutulduğu için script yeniden başlasa bile kaybolmaz."""
     row = conn.execute(f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac FROM aktif_islem_{tf} WHERE id=1").fetchone()
 
     def durumu_kaydet(aktif, sayac):
@@ -590,13 +603,6 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
     return kapanan
 
 def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):
-    """CVD gün başından (UTC 00:00) itibaren kümülatif bir sayaç olduğu için, referans
-    noktası HER ZAMAN bugünün içinde kalmalı — düne taşarsa sayacın sıfırlandığı noktayı
-    geçmiş oluruz, anlamsız bir sıçrama görürüz. Ama tam N periyot şartını da katı
-    tutmuyoruz: N periyot öncesi bugünün dışına düşüyorsa (örn. gün henüz 24sa'lık
-    veri biriktirmemişse), bunun yerine BUGÜNÜN İLK kaydını referans alırız — 'tam 24
-    saat' değil 'bugün elimizde ne kadarı varsa o kadarı' mantığı. Gün ilerledikçe bu
-    otomatik olarak gerçek ~24 saatlik farka yakınsar."""
     bugun_df = df_veri[df_veri['tarih'] == tarih_str]
     if bugun_df.empty:
         return None, None  # bugün henüz hiç kayıt yok
@@ -607,6 +613,65 @@ def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, 
         ref = bugun_df.iloc[0]  # tam N periyot bugünün dışına taşıyor -> bugünün ilk kaydına düş
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
+
+def compute_adaptive_tf_thresholds(df_veri):
+    """Her timeframe için, son `lookback_days` günün HER BİRİNİN kendi 'gürültü'
+    seviyesini (o gün içindeki, _rolling_hareket_mesafesi ile ölçülen N-periyotluk
+    dip/tepe mesafelerinin `noise_percentile`'ı) ayrı ayrı hesaplar. Bu günlerden
+    EN DÜŞÜK gürültüye sahip `quiet_days` tanesini seçip onların ortalamasını eşik
+    olarak kullanır -- fikir: piyasanın 'sakin' günlerinde tipik hareket ne kadarsa,
+    bunun altında kalan hareketler gürültü/Nötr, üstündekiler gerçek sinyal sayılsın.
+    OI ve fiyat için ayrı ayrı hesaplanır (en sakin 3 gün ikisi için farklı olabilir).
+    Yeterli gün/veri yoksa o tf için None döner; çağıran taraf statik config
+    değerlerine (oi_pct/price_pct) düşer."""
+    ac = CONFIG.get('adaptive', {})
+    if not ac.get('enabled', True):
+        return None
+    if 'tarih' not in df_veri.columns or len(df_veri) == 0:
+        return None
+
+    quiet_days_n = ac.get('quiet_days', 3)
+    lookback_days = ac.get('lookback_days', 7)
+    p = ac.get('noise_percentile', 90)
+
+    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
+    if len(gunler) < quiet_days_n:
+        return None
+    gunler = gunler[-lookback_days:]
+
+    sonuc = {}
+    for tf, tf_conf in CONFIG['timeframes'].items():
+        periods = tf_conf['periods']
+
+        # Tüm seri için TEK SEFERDE hesapla; (pozisyon, mesafe) çiftleri güne göre
+        # gruplamak için kullanılacak -- _periyot_durumu'yla birebir aynı ölçüt.
+        oi_mesafe_pos = _rolling_hareket_mesafesi(df_veri['oi_btc'], periods)
+        price_mesafe_pos = _rolling_hareket_mesafesi(df_veri['price'], periods)
+
+        gun_gurultu = {}  # {gun: {'oi': persentil, 'price': persentil}}
+        for gun in gunler:
+            pos_set = set(df_veri.index[df_veri['tarih'] == gun])
+
+            oi_mesafeler = [m for pos, m in oi_mesafe_pos if pos in pos_set]
+            price_mesafeler = [m for pos, m in price_mesafe_pos if pos in pos_set]
+            if len(oi_mesafeler) < 3 or len(price_mesafeler) < 3:
+                continue
+            gun_gurultu[gun] = {
+                'oi': float(np.percentile(oi_mesafeler, p)),
+                'price': float(np.percentile(price_mesafeler, p)),
+            }
+
+        if len(gun_gurultu) < quiet_days_n:
+            sonuc[tf] = None
+            continue
+
+        en_sakin_oi = sorted(gun_gurultu.values(), key=lambda v: v['oi'])[:quiet_days_n]
+        en_sakin_price = sorted(gun_gurultu.values(), key=lambda v: v['price'])[:quiet_days_n]
+        sonuc[tf] = {
+            'oi_pct': float(np.mean([v['oi'] for v in en_sakin_oi])),
+            'price_pct': float(np.mean([v['price'] for v in en_sakin_price])),
+        }
+    return sonuc
 
 def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
@@ -640,6 +705,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
 
     tf_sonuclari = {}
     kapanan_islemler = {}
+    adaptif = compute_adaptive_tf_thresholds(df_gecmis)
     mevcut_saat, mevcut_dakika = now.hour, now.minute
 
     for tf, tf_conf in CONFIG['timeframes'].items():
@@ -647,8 +713,12 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
             continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
 
-        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], 'oi_btc')
-        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], 'price')
+        tf_adaptif = adaptif.get(tf) if adaptif else None
+        oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
+        price_esik = tf_adaptif['price_pct'] if tf_adaptif else tf_conf['price_pct']
+
+        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], oi_esik, 'oi_btc')
+        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], price_esik, 'price')
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
 
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:

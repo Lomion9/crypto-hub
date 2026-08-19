@@ -107,6 +107,12 @@
   "funding_thresholds": {
     "extreme_pct": 0.003
   },
+  "adaptive": {
+    "enabled": true,
+    "lookback_days": 7,
+    "quiet_days": 3,
+    "noise_percentile": 90
+  },
   "telegram": {
     "min_interval_minutes": 60
   },
@@ -115,6 +121,6 @@
     "interval_seconds": 30
   },
   "huobi": {
-    "delay_seconds": 50
+    "delay_seconds": 20
   }
 }
