@@ -110,8 +110,8 @@
   "adaptive": {
     "enabled": true,
     "lookback_days": 7,
-    "quiet_days": 3,
-    "noise_percentile": 90
+    "quiet_days": 2,
+    "noise_percentile": 75
   },
   "telegram": {
     "min_interval_minutes": 60

@@ -29,8 +29,8 @@ DEFAULT_CONFIG = {
     "adaptive": {
         "enabled": True,
         "lookback_days": 7,
-        "quiet_days": 3,
-        "noise_percentile": 90
+        "quiet_days": 2,
+        "noise_percentile": 80
     },
     "telegram": {
         "min_interval_minutes": 60
@@ -40,20 +40,16 @@ DEFAULT_CONFIG = {
         "interval_seconds": 30
     },
     "huobi": {
-        "delay_seconds": 50
+        "delay_seconds": 20
     }
 }
 
 def load_config():
-    """config.json varsa oradan okur; yoksa (ilk çalıştırma) varsayılan değerlerle
-    dosyayı kendisi oluşturur. Eşikleri değiştirmek için artık kod açmana gerek yok —
-    sadece config.json içindeki sayıyı değiştirip kaydetmen yeterli (script'i yeniden
-    başlattığında yeni değerler devreye girer)."""
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
-            merged = json.loads(json.dumps(DEFAULT_CONFIG))  # derin kopya
+            merged = json.loads(json.dumps(DEFAULT_CONFIG))  
             for section, values in user_config.items():
                 if section in merged and isinstance(values, dict):
                     merged[section].update(values)
@@ -77,20 +73,9 @@ CONFIG = load_config()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-_LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
+_LAST_TELEGRAM_DURUMLAR = {}  
 
 def should_send_telegram(tf_sonuclari):
-    """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., ...}}.
-    Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri Bekleniyor' DIŞINDA bir şey
-    gösterip kendi son gönderilen durumundan FARKLI OLDUĞUNDA VE 'telegram_uygun'
-    (konfirmasyon şartı — bkz. log_snapshot/son_tf_genel_durumlar) sağlandığında
-    True döner. 15dk'nın telegram_uygun'u her zaman False'tur, yani 15dk hiçbir
-    zaman tek başına mesaj tetiklemez.
-
-    ÖNEMLİ: bir değişiklik farkedilip henüz KONFİRME OLMADIYSA, _LAST_TELEGRAM_DURUMLAR
-    GÜNCELLENMEZ — böylece bir sonraki turda konfirmasyon sağlanırsa (aynı genel_durum
-    hâlâ geçerliyken) hâlâ 'yeni' sayılıp gönderilir. Sadece FİİLEN gönderilen (ya da
-    'İşlem Açma'/'Veri Bekleniyor' gibi nötr) durumlar son-gönderilen state'i günceller."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
@@ -103,7 +88,6 @@ def should_send_telegram(tf_sonuclari):
             if sonuc.get('telegram_uygun'):
                 gonder = True
                 _LAST_TELEGRAM_DURUMLAR[tf] = gd
-            # konfirme olmadıysa onceki'yi güncelleme: değişiklik "beklemede" kalsın
     return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
@@ -283,10 +267,6 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
         return 0.0
 
 def fetch_with_retry(fetch_func, *args, retries=2, delay=3, **kwargs):
-    """Bir borsa çağrısı geçici bir hatadan (network blip, rate limit, borsanın
-    anlık kesintisi vb.) dolayı 0 dönerse, tüm satırı 'başarısız' loglamadan önce
-    birkaç kez daha dener. Kalıcı bir sorun varsa (borsa gerçekten çökmüşse)
-    yine de son denemeden sonra 0,0 döner ve failed_borsalar listesine düşer."""
     oi, funding = 0, 0
     for attempt in range(retries + 1):
         oi, funding = fetch_func(*args, **kwargs)
@@ -311,11 +291,6 @@ def get_global_macro_data():
         'Hyperliquid': fetch_with_retry(get_custom_hyperliquid_data)
     }
 
-    # Huobi/HTX: diğer borsalarla aynı anda (dakika sınırında herkesin isteği
-    # aynı saniyeye denk geldiği "izdiham" anında) çağrılmıyor — kısa bir süre
-    # bekleyip trafiğin sakinleştiği bir ana kaydırıyoruz. Süre config.json ->
-    # huobi.delay_seconds ile ayarlanabilir (debug modunda hızlıca test etmek
-    # istersen 0'a çekebilirsin).
     huobi_delay = CONFIG.get('huobi', {}).get('delay_seconds', 30)
     if huobi_delay > 0:
         print(f"  ⏳ Huobi çağrılarından önce {huobi_delay}sn bekleniyor (dakika sınırı izdihamından kaçınmak için)...")
@@ -335,7 +310,6 @@ def get_global_macro_data():
     FUNDING_INTERVAL_HOURS = {k: 8 for k in markets.keys()}
     FUNDING_INTERVAL_HOURS['Hyperliquid'] = 1
 
-    # Silinen Borsa Loglarını Geri Getirdik
     print("\n--- Borsa ve Tahta Kırılımları (Funding 8s'e normalize edilmiş) ---")
     normalized = {}
     failed_borsalar = []
@@ -363,7 +337,7 @@ def get_global_macro_data():
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
 # ==========================================
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi_funding_history.db")
-HISTORY_FILE = DB_FILE  # geri uyumluluk için aynı isim korunuyor
+HISTORY_FILE = DB_FILE  
 VERI_COLS = ['tarih', 'saat', 'oi_btc', 'oi_usd', 'funding_pct', 'price', 'cvd_spot_btc', 'cvd_perp_btc']
 
 def get_btc_price():
@@ -373,10 +347,6 @@ def get_btc_price():
     except: return 0.0
 
 def _init_db(conn):
-    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem üçlüsü oluşturur.
-    durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır (otomatik artan değil, elle
-    veriliyor) — böylece hangi durum satırının hangi veri satırına ait olduğu asla
-    tarih+saat metin eşleşmesine bağlı kalmaz, id ile garanti hizalı kalır."""
     conn.execute('''CREATE TABLE IF NOT EXISTS veri (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT, saat TEXT, oi_btc REAL, oi_usd REAL, funding_pct REAL,
@@ -399,9 +369,6 @@ def _init_db(conn):
     conn.commit()
 
 def load_history(path=DB_FILE):
-    """Sadece 'veri' tablosunu okur — timeframe durumları artık geçmişe bakmak için
-    ayrı bir join gerektirmiyor, her timeframe kendi periyot kadar geriye gidip
-    doğrudan 'veri' tablosundaki oi_btc/price'a bakıyor (bkz. _periyot_durumu)."""
     conn = sqlite3.connect(path)
     _init_db(conn)
     veri_df = pd.read_sql("SELECT * FROM veri", conn)
@@ -428,10 +395,6 @@ def funding_status(current_funding):
     return "Nötr"
 
 def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
-    """ROLLING-MIN / ROLLING-MAX + EŞİK: son N periyotluk pencerenin dip/tepesine
-    olan mesafelerden büyük olanı esik_pct'yi geçmiyorsa Nötr döner (akümülasyon/
-    dağıtım tespiti Nötr'e ihtiyaç duyar); geçiyorsa hangi mesafe büyükse o yön
-    (Artıyor/Düşüyor) döner."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
     pencere = df_veri[kolon].iloc[-periods:]
@@ -448,11 +411,6 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
     return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
 
 def _rolling_hareket_mesafesi(seri, periods):
-    """Bir kolon (Series, kronolojik sıralı, POZİSYONEL/0-tabanlı index) için,
-    her geçerli noktada 'son N periyotluk pencerenin dip/tepesine olan en büyük
-    mesafe' değerini (pozisyon, mesafe) çiftleri olarak döndürür — _periyot_durumu
-    ile BİREBİR aynı ölçütle. Pozisyon bilgisi, güne göre gruplamak (adaptive eşik
-    hesabı) için taşınıyor; eksik/geçersiz noktalar listede hiç yer almaz."""
     sonuc = []
     for i in range(periods, len(seri)):
         pencere = seri.iloc[i - periods:i]
@@ -488,19 +446,13 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
-    # Long taraf: funding Aşırı Pozitif -> longlar baskın/kaldıraçlı
     long_trap = (fund_positive and oi_status == "Artıyor" and price_status == "Düşüyor")
     long_squeeze = (fund_positive and oi_status == "Düşüyor" and price_status == "Düşüyor")
 
-    # Short taraf: funding Aşırı Negatif -> shortlar baskın/kaldıraçlı (long tarafın aynası)
     short_trap = (fund_negative and oi_status == "Artıyor" and price_status == "Artıyor")
     short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
 
     if short_squeeze:
-        # NOT: eskiden "Sağlıklı Long (Squeeze + Organik Talep)" döndürülüyordu ama
-        # _islem_yonu tam "Sağlıklı Long" arıyordu -> hiç eşleşmiyordu, bu yüzden
-        # "sağlıklı long" hiç tetiklenmiyormuş gibi görünüyordu. Etiketler artık
-        # _islem_yonu ile birebir aynı (parantezli açıklamalar kaldırıldı).
         return "Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"
 
     if long_squeeze:
@@ -521,20 +473,12 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
             return "İşlem Açma (Olası Dağıtım - Spot Satış Baskın)"
         return "Short Trap"
 
-    # AKÜMÜLASYON / DAĞITIM: fiyat yatay (Nötr) ama OI birikiyor (Artıyor) -> pozisyon
-    # sessizce kuruluyor demektir; yön, hangi tarafın (spot alım mı satım mı) baskın
-    # olduğuna, yani CVD spot'un işaretine ve perp'e göre baskınlığına bakılarak
-    # belirlenir. Bu iki durum funding'in extreme olup olmamasından bağımsızdır --
-    # trap/squeeze koşulları zaten üstte elenmiş olduğu için buraya sadece price_status
-    # Nötr olduğunda düşülür.
     if price_status == "Nötr" and oi_status == "Artıyor":
         if cvd_spot > 0 and cvd_spot >= abs(cvd_perp):
             return "Akümülasyon"
         if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
             return "Dağıtım"
 
-    # Fonlama Nötr Pozitif veya Nötr Negatif ise (ya da yukarıdaki hiçbir setup
-    # oluşmadıysa) herhangi bir tasfiye/birikim setup'ı aranmaz
     return "İşlem Açma"
 
 def _islem_yonu(genel_durum_deger):
@@ -605,25 +549,16 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
 def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):
     bugun_df = df_veri[df_veri['tarih'] == tarih_str]
     if bugun_df.empty:
-        return None, None  # bugün henüz hiç kayıt yok
+        return None, None  
 
     if len(df_veri) >= periods and df_veri.iloc[-periods]['tarih'] == tarih_str:
         ref = df_veri.iloc[-periods]
     else:
-        ref = bugun_df.iloc[0]  # tam N periyot bugünün dışına taşıyor -> bugünün ilk kaydına düş
+        ref = bugun_df.iloc[0] 
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
 def compute_adaptive_tf_thresholds(df_veri):
-    """Her timeframe için, son `lookback_days` günün HER BİRİNİN kendi 'gürültü'
-    seviyesini (o gün içindeki, _rolling_hareket_mesafesi ile ölçülen N-periyotluk
-    dip/tepe mesafelerinin `noise_percentile`'ı) ayrı ayrı hesaplar. Bu günlerden
-    EN DÜŞÜK gürültüye sahip `quiet_days` tanesini seçip onların ortalamasını eşik
-    olarak kullanır -- fikir: piyasanın 'sakin' günlerinde tipik hareket ne kadarsa,
-    bunun altında kalan hareketler gürültü/Nötr, üstündekiler gerçek sinyal sayılsın.
-    OI ve fiyat için ayrı ayrı hesaplanır (en sakin 3 gün ikisi için farklı olabilir).
-    Yeterli gün/veri yoksa o tf için None döner; çağıran taraf statik config
-    değerlerine (oi_pct/price_pct) düşer."""
     ac = CONFIG.get('adaptive', {})
     if not ac.get('enabled', True):
         return None
@@ -643,8 +578,6 @@ def compute_adaptive_tf_thresholds(df_veri):
     for tf, tf_conf in CONFIG['timeframes'].items():
         periods = tf_conf['periods']
 
-        # Tüm seri için TEK SEFERDE hesapla; (pozisyon, mesafe) çiftleri güne göre
-        # gruplamak için kullanılacak -- _periyot_durumu'yla birebir aynı ölçüt.
         oi_mesafe_pos = _rolling_hareket_mesafesi(df_veri['oi_btc'], periods)
         price_mesafe_pos = _rolling_hareket_mesafesi(df_veri['price'], periods)
 
@@ -673,12 +606,14 @@ def compute_adaptive_tf_thresholds(df_veri):
         }
     return sonuc
 
-def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
-    now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
+def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=None):
+    if now is None:
+        now = datetime.now(timezone(timedelta(hours=3)))
+    now = now.replace(tzinfo=None)
     oi_usd = oi * price
     funding = float(funding)
 
-    df_gecmis = load_history(path)  # sadece 'veri' tablosu — her tf kendi periyodu kadar geriye bakacak
+    df_gecmis = load_history(path)  
 
     row_data = {
         'tarih': now.strftime('%d.%m.%Y'),
@@ -693,7 +628,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
 
     fund_status = funding_status(funding)
 
-    conn = sqlite3.connect(path, timeout=30)  # dosya anlık kilitliyse (örn. DB Browser açıksa) 30sn'ye kadar bekler
+    conn = sqlite3.connect(path, timeout=30)  
     _init_db(conn)
 
     cur = conn.execute(
@@ -711,7 +646,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     for tf, tf_conf in CONFIG['timeframes'].items():
         sinir_saatleri = tf_conf.get('sinir_saatleri')
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
-            continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
+            continue  
 
         tf_adaptif = adaptif.get(tf) if adaptif else None
         oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
@@ -733,14 +668,6 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
             (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel)
         )
 
-        # TELEGRAM KONFİRMASYON ŞARTI: 15dk kendi sinyalini asla doğrudan Telegram'a
-        # göndermez (telegram_uygun=False sabit). Diğer tf'ler için: kendi
-        # confirm_kaynak tf'inden son confirm_n adet genel_durum kaydından (bu
-        # turda kaynak tf için yeni yazılan kayıt varsa o da dahil) en az biri, BU
-        # tf'in genel_durum'uyla birebir aynı olmalı — yoksa mesaj atlanır (ama
-        # durum_{tf} tablosuna ve genel akışa normal şekilde yazılmaya devam eder).
-        # Zincir: 1sa/2sa -> son 4/8 adet 15dk durumu, 4sa/8sa -> son 4/8 adet 1sa
-        # durumu, 24sa -> son 6 adet 4sa durumu.
         if tf == '15dk':
             telegram_uygun = False
         elif genel == "Veri Bekleniyor":
@@ -766,7 +693,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     print(f"  Funding Durumu : {fund_status}   |   Gün içi toplam CVD -> Spot:{cvd_spot:+.2f} Perp:{cvd_perp:+.2f}")
     for tf in CONFIG['timeframes'].keys():
         if tf not in tf_sonuclari:
-            continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
+            continue  
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
     for tf, k in kapanan_islemler.items():
@@ -807,6 +734,7 @@ def print_trend_report(df):
     print("-" * 60)
 
 def run_snapshot_and_report():
+    baslangic_zamani = datetime.now(timezone(timedelta(hours=3))) 
     total_oi, global_funding, failed_borsalar = get_global_macro_data()
 
     if failed_borsalar:
@@ -818,7 +746,6 @@ def run_snapshot_and_report():
         print("  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — fiyat verisi alınamadı.")
         return None
     
-    # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
     cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
     cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
@@ -826,7 +753,7 @@ def run_snapshot_and_report():
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
     
-    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
+    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani)
 
     report_text = build_telegram_report(
         failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
@@ -842,10 +769,6 @@ def run_snapshot_and_report():
     return df
 
 def _sonraki_sinira_kadar_bekle(interval_minutes):
-    """Sabit dakika sıfırlarına (örn. 15dk için :00/:15/:30/:45) göre bekler —
-    time.sleep(interval*60) kullanmıyoruz çünkü her turun işlem süresi (API çağrıları
-    vb.) birikip zamanla saatten kaymaya sebep olur. Bu fonksiyon her seferinde
-    GERÇEK saate göre yeniden hesaplar, drift birikmez."""
     simdi = datetime.now(timezone(timedelta(hours=3)))
     gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
     gecen_dakika = (simdi - gun_baslangic).total_seconds() / 60
