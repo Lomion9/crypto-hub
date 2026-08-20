@@ -17,11 +17,11 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULT_CONFIG = {
     "timeframes": {
         "15dk": {"periods": 1, "oi_pct": 0.31, "price_pct": 0.22, "kapanis_esigi": 3, "sinir_saatleri": None},
-        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43, "kapanis_esigi": 1, "sinir_saatleri": list(range(24))},
-        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72, "kapanis_esigi": 1, "sinir_saatleri": [1,3,5,7,9,11,13,15,17,19,21,23]},
-        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08, "kapanis_esigi": 1, "sinir_saatleri": [23,3,7,11,15,19]},
-        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36, "kapanis_esigi": 1, "sinir_saatleri": [3,11,19]},
-        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76, "kapanis_esigi": 1, "sinir_saatleri": [3]}
+        "1sa":  {"periods": 4, "oi_pct": 0.88, "price_pct": 0.43, "kapanis_esigi": 1, "sinir_saatleri": list(range(24)), "confirm_kaynak": "15dk", "confirm_n": 4},
+        "2sa":  {"periods": 8, "oi_pct": 1.65, "price_pct": 0.72, "kapanis_esigi": 1, "sinir_saatleri": [1,3,5,7,9,11,13,15,17,19,21,23], "confirm_kaynak": "15dk", "confirm_n": 8},
+        "4sa":  {"periods": 16, "oi_pct": 3.08, "price_pct": 1.08, "kapanis_esigi": 1, "sinir_saatleri": [23,3,7,11,15,19], "confirm_kaynak": "1sa", "confirm_n": 4},
+        "8sa":  {"periods": 32, "oi_pct": 5.10, "price_pct": 1.36, "kapanis_esigi": 1, "sinir_saatleri": [3,11,19], "confirm_kaynak": "1sa", "confirm_n": 8},
+        "24sa": {"periods": 96, "oi_pct": 7.73, "price_pct": 1.76, "kapanis_esigi": 1, "sinir_saatleri": [3], "confirm_kaynak": "4sa", "confirm_n": 6}
     },
     "funding_thresholds": {
         "extreme_pct": 0.0030
@@ -29,12 +29,18 @@ DEFAULT_CONFIG = {
     "adaptive": {
         "enabled": True,
         "lookback_days": 7,
-        "min_days_required": 3,
-        "noise_percentile": 90,
-        "multiplier": 1.1
+        "quiet_days": 2,
+        "noise_percentile": 80
     },
     "telegram": {
         "min_interval_minutes": 60
+    },
+    "debug": {
+        "enabled": False,
+        "interval_seconds": 30
+    },
+    "huobi": {
+        "delay_seconds": 20
     }
 }
 
@@ -43,7 +49,7 @@ def load_config():
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
-            merged = json.loads(json.dumps(DEFAULT_CONFIG))  # derin kopya
+            merged = json.loads(json.dumps(DEFAULT_CONFIG))  
             for section, values in user_config.items():
                 if section in merged and isinstance(values, dict):
                     merged[section].update(values)
@@ -67,7 +73,7 @@ CONFIG = load_config()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-_LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
+_LAST_TELEGRAM_DURUMLAR = {}  
 
 def should_send_telegram(tf_sonuclari):
     global _LAST_TELEGRAM_DURUMLAR
@@ -79,8 +85,9 @@ def should_send_telegram(tf_sonuclari):
             _LAST_TELEGRAM_DURUMLAR[tf] = gd
             continue
         if gd != onceki:
-            gonder = True
-        _LAST_TELEGRAM_DURUMLAR[tf] = gd
+            if sonuc.get('telegram_uygun'):
+                gonder = True
+                _LAST_TELEGRAM_DURUMLAR[tf] = gd
     return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
@@ -260,10 +267,6 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
         return 0.0
 
 def fetch_with_retry(fetch_func, *args, retries=2, delay=3, **kwargs):
-    """Bir borsa çağrısı geçici bir hatadan (network blip, rate limit, borsanın
-    anlık kesintisi vb.) dolayı 0 dönerse, tüm satırı 'başarısız' loglamadan önce
-    birkaç kez daha dener. Kalıcı bir sorun varsa (borsa gerçekten çökmüşse)
-    yine de son denemeden sonra 0,0 döner ve failed_borsalar listesine düşer."""
     oi, funding = 0, 0
     for attempt in range(retries + 1):
         oi, funding = fetch_func(*args, **kwargs)
@@ -285,10 +288,16 @@ def get_global_macro_data():
         'Bybit_USD': fetch_with_retry(get_custom_bybit_data, category='inverse', symbol='BTCUSD'),
         'OKX_USDT': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USDT:USDT'),
         'OKX_USD': fetch_with_retry(get_standard_ccxt_data, 'okx', 'BTC/USD:BTC'),
-        'Huobi_USDT': fetch_with_retry(get_custom_huobi_data, category='linear'),
-        'Huobi_USD': fetch_with_retry(get_custom_huobi_data, category='inverse'),
         'Hyperliquid': fetch_with_retry(get_custom_hyperliquid_data)
     }
+
+    huobi_delay = CONFIG.get('huobi', {}).get('delay_seconds', 30)
+    if huobi_delay > 0:
+        print(f"  ⏳ Huobi çağrılarından önce {huobi_delay}sn bekleniyor (dakika sınırı izdihamından kaçınmak için)...")
+        time.sleep(huobi_delay)
+
+    markets['Huobi_USDT'] = fetch_with_retry(get_custom_huobi_data, category='linear')
+    markets['Huobi_USD'] = fetch_with_retry(get_custom_huobi_data, category='inverse')
     
     hl_funding_8h_real = get_hyperliquid_funding_8h_real('BTC')
 
@@ -301,7 +310,6 @@ def get_global_macro_data():
     FUNDING_INTERVAL_HOURS = {k: 8 for k in markets.keys()}
     FUNDING_INTERVAL_HOURS['Hyperliquid'] = 1
 
-    # Silinen Borsa Loglarını Geri Getirdik
     print("\n--- Borsa ve Tahta Kırılımları (Funding 8s'e normalize edilmiş) ---")
     normalized = {}
     failed_borsalar = []
@@ -329,7 +337,7 @@ def get_global_macro_data():
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
 # ==========================================
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi_funding_history.db")
-HISTORY_FILE = DB_FILE  # geri uyumluluk için aynı isim korunuyor
+HISTORY_FILE = DB_FILE  
 VERI_COLS = ['tarih', 'saat', 'oi_btc', 'oi_usd', 'funding_pct', 'price', 'cvd_spot_btc', 'cvd_perp_btc']
 
 def get_btc_price():
@@ -339,10 +347,6 @@ def get_btc_price():
     except: return 0.0
 
 def _init_db(conn):
-    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem üçlüsü oluşturur.
-    durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır (otomatik artan değil, elle
-    veriliyor) — böylece hangi durum satırının hangi veri satırına ait olduğu asla
-    tarih+saat metin eşleşmesine bağlı kalmaz, id ile garanti hizalı kalır."""
     conn.execute('''CREATE TABLE IF NOT EXISTS veri (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT, saat TEXT, oi_btc REAL, oi_usd REAL, funding_pct REAL,
@@ -365,9 +369,6 @@ def _init_db(conn):
     conn.commit()
 
 def load_history(path=DB_FILE):
-    """Sadece 'veri' tablosunu okur — timeframe durumları artık geçmişe bakmak için
-    ayrı bir join gerektirmiyor, her timeframe kendi periyot kadar geriye gidip
-    doğrudan 'veri' tablosundaki oi_btc/price'a bakıyor (bkz. _periyot_durumu)."""
     conn = sqlite3.connect(path)
     _init_db(conn)
     veri_df = pd.read_sql("SELECT * FROM veri", conn)
@@ -394,25 +395,41 @@ def funding_status(current_funding):
     return "Nötr"
 
 def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
-    """Mum/pencere DEĞİL — 'şu an, N periyot önceki tek noktaya göre ne durumda' mantığı.
-    df_veri kronolojik sıralı olmalı (load_history zaten öyle döndürüyor). N periyot
-    öncesi = df_veri'nin sondan N'inci satırı (15dk aralıkla, 1sa için N=4, 4sa için N=16 vb.)."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
-    ref = df_veri[kolon].iloc[-periods]
-    if not ref:
+    pencere = df_veri[kolon].iloc[-periods:]
+    if pencere.isna().any() or (pencere <= 0).any() or not mevcut_deger:
         return "Veri Bekleniyor"
-    degisim_pct = (mevcut_deger - ref) / ref * 100
-    if degisim_pct > esik_pct:
-        return "Artıyor"
-    elif degisim_pct < -esik_pct:
-        return "Düşüyor"
-    return "Nötr"
+
+    pencere_min = pencere.min()
+    pencere_max = pencere.max()
+    artis_pct = (mevcut_deger - pencere_min) / pencere_min * 100
+    dusus_pct = (pencere_max - mevcut_deger) / pencere_max * 100
+
+    if artis_pct <= esik_pct and dusus_pct <= esik_pct:
+        return "Nötr"
+    return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
+
+def _rolling_hareket_mesafesi(seri, periods):
+    sonuc = []
+    for i in range(periods, len(seri)):
+        pencere = seri.iloc[i - periods:i]
+        mevcut = seri.iloc[i]
+        if pencere.isna().any() or (pencere <= 0).any() or not mevcut or mevcut <= 0:
+            continue
+        pmin, pmax = pencere.min(), pencere.max()
+        artis = (mevcut - pmin) / pmin * 100
+        dusus = (pmax - mevcut) / pmax * 100
+        sonuc.append((i, max(artis, dusus)))
+    return sonuc
+
+def son_tf_genel_durumlar(conn, kaynak_tf, n):
+    rows = conn.execute(
+        f"SELECT genel_durum FROM durum_{kaynak_tf} ORDER BY id DESC LIMIT ?", (n,)
+    ).fetchall()
+    return [r[0] for r in rows]
 
 def cvd_durumu(cvd_spot, cvd_perp):
-    """Spot ve perp CVD'nin yönünü karşılaştırıp diverjans olup olmadığını etiketler.
-    Aynı yöndeyse baskı 'uyumlu' (spot ve kaldıraç aynı tarafta), zıt yöndeyse 'diverjans'
-    (biri gerçek talebi, diğeri kaldıraç baskısını gösteriyor demektir)."""
     spot_yon = "Long" if cvd_spot > 0 else ("Short" if cvd_spot < 0 else "Nötr")
     perp_yon = "Long" if cvd_perp > 0 else ("Short" if cvd_perp < 0 else "Nötr")
 
@@ -426,72 +443,55 @@ def cvd_durumu(cvd_spot, cvd_perp):
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
-    """
-    Tetikleyici Şartı:
-    Piyasa yapıcıların tasfiye (likidasyon) avına çıkması için fonlamanın
-    'Nötr Pozitif/Negatif' değil, 'Aşırı' seviyelerde olması gerekir.
-
-    Long ve Short taraf simetrik kurulmuştur:
-    - long_trap / short_trap: pozisyon HENÜZ birikiyor, fiyat aleyhte gidiyor (tuzak kuruluyor)
-    - long_squeeze / short_squeeze: pozisyon tasfiye OLUYOR, an itibariyle kapanış baskısı var
-    """
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
-    # Long taraf: funding Aşırı Pozitif -> longlar baskın/kaldıraçlı
     long_trap = (fund_positive and oi_status == "Artıyor" and price_status == "Düşüyor")
     long_squeeze = (fund_positive and oi_status == "Düşüyor" and price_status == "Düşüyor")
 
-    # Short taraf: funding Aşırı Negatif -> shortlar baskın/kaldıraçlı (long tarafın aynası)
     short_trap = (fund_negative and oi_status == "Artıyor" and price_status == "Artıyor")
     short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
 
     if short_squeeze:
-        return "Sağlıklı Long (Squeeze + Organik Talep)" if cvd_spot > 0 else "Short Squeeze (Zayıf Temel)"
+        return "Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"
 
     if long_squeeze:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
-        return "Sağlıklı Short (Squeeze + Organik Satış)" if cvd_spot < 0 else "Long Squeeze (Zayıf Temel)"
+        return "Sağlıklı Short" if cvd_spot < 0 else "Long Squeeze"
 
     if long_trap:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
             return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
-        return "Long Trap (Devam Riski)"
+        return "Long Trap"
 
     if short_trap:
         dagitim_riski = cvd_spot < 0 and abs(cvd_spot) > abs(cvd_perp)
         if dagitim_riski:
             return "İşlem Açma (Olası Dağıtım - Spot Satış Baskın)"
-        return "Short Trap (Devam Riski)"
+        return "Short Trap"
 
-    # Fonlama Nötr Pozitif veya Nötr Negatif ise herhangi bir tasfiye setup'ı aranmaz
+    if price_status == "Nötr" and oi_status == "Artıyor":
+        if cvd_spot > 0 and cvd_spot >= abs(cvd_perp):
+            return "Akümülasyon"
+        if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
+            return "Dağıtım"
+
     return "İşlem Açma"
 
 def _islem_yonu(genel_durum_deger):
-    """Sinyalin ima ettiği yön: fiyatın düşmesini bekleyen sinyaller (Trap/Squeeze
-    'aşağı' türleri) short, yükselmesini bekleyenler long kabul edilir. Absorption/
-    dağıtım gibi yönü belirsiz olanlar için None döner."""
-    long_sinyaller = {"Sağlıklı Long (Squeeze + Organik Talep)", "Short Squeeze (Zayıf Temel)", "Short Trap (Devam Riski)"}
-    short_sinyaller = {"Sağlıklı Short (Squeeze + Organik Satış)", "Long Squeeze (Zayıf Temel)", "Long Trap (Devam Riski)"}
+    long_sinyaller = {"Sağlıklı Long", "Short Squeeze", "Short Trap", "Akümülasyon"}
+    short_sinyaller = {"Sağlıklı Short", "Long Squeeze", "Long Trap", "Dağıtım"}
     if genel_durum_deger in long_sinyaller:
         return 'long'
     if genel_durum_deger in short_sinyaller:
         return 'short'
     return None
 
+
 def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3):
-    """'Sanal işlem' takibi — artık HER TIMEFRAME için ayrı ayrı çalışır (tf parametresi
-    aktif_islem_{tf} / sinyal_{tf} tablolarını seçer). genel_durum 'İşlem Açma' dışına
-    çıktığında o andaki fiyat giriş kabul edilir. Sonraki kayıtlar aktif duruma eşitse
-    sayaç sıfırlanır (hâlâ aynı sinyal). Aktif durumdan kapanis_esigi kadar ÜST ÜSTE
-    farklı bir şey gelirse (kısa vadede gürültüye karşı tampon, uzun vadede genelde 1 —
-    ilk farklı kayıtta hemen kapanır), o kayıttaki fiyat çıkış kabul edilip yöne göre
-    (long/short) % kâr hesaplanıp sinyal_{tf} tablosuna yazılır. Kapanışa sebep olan
-    kayıt kendisi de bir sinyalse, yeni takip hemen oradan zincirlenerek başlar.
-    Takip SQLite'ta tutulduğu için script yeniden başlasa bile kaybolmaz."""
     row = conn.execute(f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac FROM aktif_islem_{tf} WHERE id=1").fetchone()
 
     def durumu_kaydet(aktif, sayac):
@@ -547,67 +547,73 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
     return kapanan
 
 def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):
-    """CVD gün başından (UTC 00:00) itibaren kümülatif bir sayaç olduğu için, referans
-    noktası HER ZAMAN bugünün içinde kalmalı — düne taşarsa sayacın sıfırlandığı noktayı
-    geçmiş oluruz, anlamsız bir sıçrama görürüz. Ama tam N periyot şartını da katı
-    tutmuyoruz: N periyot öncesi bugünün dışına düşüyorsa (örn. gün henüz 24sa'lık
-    veri biriktirmemişse), bunun yerine BUGÜNÜN İLK kaydını referans alırız — 'tam 24
-    saat' değil 'bugün elimizde ne kadarı varsa o kadarı' mantığı. Gün ilerledikçe bu
-    otomatik olarak gerçek ~24 saatlik farka yakınsar."""
     bugun_df = df_veri[df_veri['tarih'] == tarih_str]
     if bugun_df.empty:
-        return None, None  # bugün henüz hiç kayıt yok
+        return None, None  
 
     if len(df_veri) >= periods and df_veri.iloc[-periods]['tarih'] == tarih_str:
         ref = df_veri.iloc[-periods]
     else:
-        ref = bugun_df.iloc[0]  # tam N periyot bugünün dışına taşıyor -> bugünün ilk kaydına düş
+        ref = bugun_df.iloc[0] 
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
 def compute_adaptive_tf_thresholds(df_veri):
-    """Sabit eşikler yerine, elimizdeki TÜM geçmiş veriden (df_veri) her timeframe'in
-    gerçek N-periyotluk % değişim dağılımını ölçüp eşiği otomatik ayarlar — 14/15.08
-    verisinden elle yaptığımız kalibrasyonun (90. persentil x 1.1 çarpan) sürekli
-    kendini güncelleyen hali. lookback_days'i aşan eski veri otomatik dışlanır.
-    Yeterli gün yoksa (min_days_required) None döner, çağıran taraf statik
-    config değerlerine (CONFIG['timeframes'][tf]['oi_pct']/['price_pct']) düşer."""
     ac = CONFIG.get('adaptive', {})
-    if not ac.get('enabled', False):
+    if not ac.get('enabled', True):
         return None
     if 'tarih' not in df_veri.columns or len(df_veri) == 0:
         return None
 
-    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
-    if len(gunler) < ac.get('min_days_required', 1):
-        return None
-
-    lookback_gunler = set(gunler[-ac.get('lookback_days', 7):])
-    df = df_veri[df_veri['tarih'].isin(lookback_gunler)]
-
+    quiet_days_n = ac.get('quiet_days', 3)
+    lookback_days = ac.get('lookback_days', 7)
     p = ac.get('noise_percentile', 90)
-    m = ac.get('multiplier', 1.1)
+
+    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
+    if len(gunler) < quiet_days_n:
+        return None
+    gunler = gunler[-lookback_days:]
 
     sonuc = {}
     for tf, tf_conf in CONFIG['timeframes'].items():
         periods = tf_conf['periods']
-        oi_degisimler = (df['oi_btc'].diff(periods).abs() / df['oi_btc'].shift(periods) * 100).dropna()
-        price_degisimler = (df['price'].diff(periods).abs() / df['price'].shift(periods) * 100).dropna()
-        if len(oi_degisimler) < 5:
-            sonuc[tf] = None  # yetersiz ölçüm, bu timeframe statik değerde kalsın
+
+        oi_mesafe_pos = _rolling_hareket_mesafesi(df_veri['oi_btc'], periods)
+        price_mesafe_pos = _rolling_hareket_mesafesi(df_veri['price'], periods)
+
+        gun_gurultu = {}  # {gun: {'oi': persentil, 'price': persentil}}
+        for gun in gunler:
+            pos_set = set(df_veri.index[df_veri['tarih'] == gun])
+
+            oi_mesafeler = [m for pos, m in oi_mesafe_pos if pos in pos_set]
+            price_mesafeler = [m for pos, m in price_mesafe_pos if pos in pos_set]
+            if len(oi_mesafeler) < 3 or len(price_mesafeler) < 3:
+                continue
+            gun_gurultu[gun] = {
+                'oi': float(np.percentile(oi_mesafeler, p)),
+                'price': float(np.percentile(price_mesafeler, p)),
+            }
+
+        if len(gun_gurultu) < quiet_days_n:
+            sonuc[tf] = None
             continue
+
+        en_sakin_oi = sorted(gun_gurultu.values(), key=lambda v: v['oi'])[:quiet_days_n]
+        en_sakin_price = sorted(gun_gurultu.values(), key=lambda v: v['price'])[:quiet_days_n]
         sonuc[tf] = {
-            'oi_pct': float(np.percentile(oi_degisimler, p)) * m,
-            'price_pct': float(np.percentile(price_degisimler, p)) * m,
+            'oi_pct': float(np.mean([v['oi'] for v in en_sakin_oi])),
+            'price_pct': float(np.mean([v['price'] for v in en_sakin_price])),
         }
     return sonuc
 
-def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
-    now = datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None)
+def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=None):
+    if now is None:
+        now = datetime.now(timezone(timedelta(hours=3)))
+    now = now.replace(tzinfo=None)
     oi_usd = oi * price
     funding = float(funding)
 
-    df_gecmis = load_history(path)  # sadece 'veri' tablosu — her tf kendi periyodu kadar geriye bakacak
+    df_gecmis = load_history(path)  
 
     row_data = {
         'tarih': now.strftime('%d.%m.%Y'),
@@ -622,7 +628,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
 
     fund_status = funding_status(funding)
 
-    conn = sqlite3.connect(path, timeout=30)  # dosya anlık kilitliyse (örn. DB Browser açıksa) 30sn'ye kadar bekler
+    conn = sqlite3.connect(path, timeout=30)  
     _init_db(conn)
 
     cur = conn.execute(
@@ -640,7 +646,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     for tf, tf_conf in CONFIG['timeframes'].items():
         sinir_saatleri = tf_conf.get('sinir_saatleri')
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
-            continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
+            continue  
 
         tf_adaptif = adaptif.get(tf) if adaptif else None
         oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
@@ -662,7 +668,18 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
             (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel)
         )
 
-        tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf, 'genel_durum': genel}
+        if tf == '15dk':
+            telegram_uygun = False
+        elif genel == "Veri Bekleniyor":
+            telegram_uygun = False
+        else:
+            kaynak_tf = tf_conf['confirm_kaynak']
+            kaynak_n = tf_conf['confirm_n']
+            son_durumlar = son_tf_genel_durumlar(conn, kaynak_tf, kaynak_n)
+            telegram_uygun = genel in son_durumlar
+
+        tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf,
+                             'genel_durum': genel, 'telegram_uygun': telegram_uygun}
 
         if genel != "Veri Bekleniyor":
             kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str, tf_conf.get('kapanis_esigi', 3))
@@ -676,7 +693,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE):
     print(f"  Funding Durumu : {fund_status}   |   Gün içi toplam CVD -> Spot:{cvd_spot:+.2f} Perp:{cvd_perp:+.2f}")
     for tf in CONFIG['timeframes'].keys():
         if tf not in tf_sonuclari:
-            continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
+            continue  
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
     for tf, k in kapanan_islemler.items():
@@ -717,6 +734,7 @@ def print_trend_report(df):
     print("-" * 60)
 
 def run_snapshot_and_report():
+    baslangic_zamani = datetime.now(timezone(timedelta(hours=3))) 
     total_oi, global_funding, failed_borsalar = get_global_macro_data()
 
     if failed_borsalar:
@@ -728,7 +746,6 @@ def run_snapshot_and_report():
         print("  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — fiyat verisi alınamadı.")
         return None
     
-    # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
     cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
     cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
@@ -736,7 +753,7 @@ def run_snapshot_and_report():
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
     
-    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp)
+    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani)
 
     report_text = build_telegram_report(
         failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
@@ -762,9 +779,22 @@ def _sonraki_sinira_kadar_bekle(interval_minutes):
     time.sleep(max(bekleme_saniye, 0))
 
 def run_continuous(interval_minutes=15):
-    print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
+    debug_cfg = CONFIG.get('debug', {})
+    debug_on = debug_cfg.get('enabled', False)
+    debug_interval = debug_cfg.get('interval_seconds', 30)
+
+    if debug_on:
+        print(f"⚠️  DEBUG MODU AKTİF (config.json -> debug.enabled=true): "
+              f":00/:15/:30/:45 sınırı BEKLENMEYECEK, her {debug_interval} saniyede bir "
+              f"snapshot alınacak. Bitince config.json'da debug.enabled'ı false yap.")
+    else:
+        print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
+
     while True:
-        _sonraki_sinira_kadar_bekle(interval_minutes)
+        if debug_on:
+            time.sleep(debug_interval)
+        else:
+            _sonraki_sinira_kadar_bekle(interval_minutes)
         try:
             run_snapshot_and_report()
         except Exception as e:
