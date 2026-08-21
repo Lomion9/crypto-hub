@@ -248,8 +248,22 @@ def get_global_macro_data():
     weighted_funding_sum = sum(oi * funding_8h for oi, funding_8h in normalized.values() if oi > 0)
     global_weighted_funding = (weighted_funding_sum / total_oi_btc) if total_oi_btc > 0 else 0
 
+    # Linear (USDT/USDC marjinli — Hyperliquid de USDC marjinli olduğu için buraya
+    # dahil) ile inverse (USD/coin marjinli) OI'yi AYRI topluyoruz — teminat matematiği
+    # farklı olduğu için likidasyon haritası bu ikisine farklı formül uygulayacak.
+    # Terminal/Telegram çıktısı hâlâ sadece total_oi_btc'yi (toplam) gösteriyor, bu
+    # ayrım sadece DB'ye ek kolon olarak gidiyor, görünürdeki hiçbir şey değişmiyor.
+    oi_linear_btc = sum(
+        oi for borsa, (oi, _) in normalized.items()
+        if oi > 0 and (borsa.endswith('_USDT') or borsa == 'Hyperliquid')
+    )
+    oi_inverse_btc = sum(
+        oi for borsa, (oi, _) in normalized.items()
+        if oi > 0 and borsa.endswith('_USD') and not borsa.endswith('_USDT')
+    )
+
     print("-" * 60)
     print(f"  🌍 KÜRESEL TOPLAM OI         : {total_oi_btc:,.2f} BTC")
     print(f"  ⚖️ AĞIRLIKLI FONLAMA ORANI (8s): %{global_weighted_funding:+.4f}\n")
 
-    return total_oi_btc, global_weighted_funding, failed_borsalar
+    return total_oi_btc, global_weighted_funding, failed_borsalar, oi_linear_btc, oi_inverse_btc

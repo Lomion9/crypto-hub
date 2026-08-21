@@ -117,7 +117,7 @@
     "min_interval_minutes": 60
   },
   "debug": {
-    "enabled": false,
+    "enabled":false,
     "interval_seconds": 30
   },
   "huobi": {

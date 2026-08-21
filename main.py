@@ -16,7 +16,8 @@ from telegram import should_send_telegram, send_telegram_message, build_telegram
 # ==========================================
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
 # ==========================================
-def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=None, ohlc=None):
+def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=None, ohlc=None,
+                  oi_linear=None, oi_inverse=None):
     if now is None:
         now = datetime.now(timezone(timedelta(hours=3)))
     now = now.replace(tzinfo=None)
@@ -30,6 +31,13 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     if ohlc is None:
         ohlc = {'open': price, 'high': price, 'low': price, 'close': price}
 
+    # oi_linear/oi_inverse verilmediyse (eski çağrı biçimi / test) toplamı linear'a
+    # yazıyoruz — likidasyon.py henüz devrede değilken davranışı bozmamak için.
+    if oi_linear is None:
+        oi_linear = oi
+    if oi_inverse is None:
+        oi_inverse = 0.0
+
     df_gecmis = load_history(path)  # sadece 'veri' tablosu — her tf kendi periyodu kadar geriye bakacak
 
     row_data = {
@@ -42,6 +50,8 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         'price_open': ohlc['open'],
         'price_high': ohlc['high'],
         'price_low': ohlc['low'],
+        'oi_linear_btc': oi_linear,
+        'oi_inverse_btc': oi_inverse,
         'cvd_spot_btc': cvd_spot,
         'cvd_perp_btc': cvd_perp,
     }
@@ -163,7 +173,7 @@ def print_trend_report(df):
 
 def run_snapshot_and_report():
     baslangic_zamani = datetime.now(timezone(timedelta(hours=3)))
-    total_oi, global_funding, failed_borsalar = get_global_macro_data()
+    total_oi, global_funding, failed_borsalar, oi_linear, oi_inverse = get_global_macro_data()
 
     if failed_borsalar:
         print(f"  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — veri alınamayan borsa(lar): {', '.join(failed_borsalar)}")
@@ -192,7 +202,8 @@ def run_snapshot_and_report():
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
 
-    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani, ohlc=ohlc)
+    sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani, ohlc=ohlc,
+                          oi_linear=oi_linear, oi_inverse=oi_inverse)
 
     report_text = build_telegram_report(
         failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
@@ -227,9 +238,8 @@ def run_continuous(interval_minutes=15):
     debug_interval = debug_cfg.get('interval_seconds', 30)
 
     if debug_on:
-        print(f"⚠️  DEBUG MODU AKTİF (config.json -> debug.enabled=true): "
-              f":00/:15/:30/:45 sınırı BEKLENMEYECEK, her {debug_interval} saniyede bir "
-              f"snapshot alınacak. Bitince config.json'da debug.enabled'ı false yap.")
+        print(f"⚠️  DEBUG MODU AKTİF"
+              f" her {debug_interval} saniyede bir ")
     else:
         print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
 

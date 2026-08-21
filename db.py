@@ -14,14 +14,15 @@ HISTORY_FILE = DB_FILE  # geri uyumluluk için aynı isim korunuyor
 # davranışları bozmadan sadece open/high/low ek bilgi olarak ekleniyor (likidasyon
 # haritasının 'fiyat bir seviyeye değip geri çekildi mi' tespiti için).
 VERI_COLS = ['tarih', 'saat', 'oi_btc', 'oi_usd', 'funding_pct', 'price',
-             'price_open', 'price_high', 'price_low', 'cvd_spot_btc', 'cvd_perp_btc']
+             'price_open', 'price_high', 'price_low', 'oi_linear_btc', 'oi_inverse_btc',
+             'cvd_spot_btc', 'cvd_perp_btc']
 
 def _migrate_add_ohlc_columns(conn):
-    """Var olan (eski şemalı) bir oi_funding_history.db'de price_open/high/low
-    kolonları yoksa ekler. CREATE TABLE IF NOT EXISTS zaten var olan tabloya yeni
-    kolon eklemediği için bu adım şart — yoksa eski DB'de INSERT hata verir."""
+    """Var olan (eski şemalı) bir oi_funding_history.db'de price_open/high/low ve
+    oi_linear/inverse kolonları yoksa ekler. CREATE TABLE IF NOT EXISTS zaten var olan
+    tabloya yeni kolon eklemediği için bu adım şart — yoksa eski DB'de INSERT hata verir."""
     mevcut_kolonlar = {row[1] for row in conn.execute("PRAGMA table_info(veri)").fetchall()}
-    for kolon in ('price_open', 'price_high', 'price_low'):
+    for kolon in ('price_open', 'price_high', 'price_low', 'oi_linear_btc', 'oi_inverse_btc'):
         if kolon not in mevcut_kolonlar:
             conn.execute(f"ALTER TABLE veri ADD COLUMN {kolon} REAL")
 

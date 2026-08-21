@@ -33,6 +33,29 @@ DEFAULT_CONFIG = {
     },
     "huobi": {
         "delay_seconds": 20
+    },
+    "likidasyon": {
+        # Kaldıraç seviyesi -> taban ağırlık (funding nötrken kullanılan dağılım,
+        # toplamı 1.0 olmalı). Konuşmada üzerinde durduğumuz başlangıç noktası.
+        "kaldirac_taban_agirlik": {"5": 0.20, "10": 0.30, "25": 0.25, "50": 0.15, "100": 0.10},
+        # Kaldıraç seviyesi -> bakım marjı oranı. ÖNEMLİ KISIT: her seviyede
+        # bakım marjı, 1/kaldıraç'tan (başlangıç marjı) KESİNLİKLE küçük olmalı
+        # -- aksi halde pozisyon açılır açılmaz zaten likide olması gerekirdi
+        # (matematiksel olarak imkansız, hiçbir borsa buna izin vermez).
+        # Gerçek borsa pratiğinde yüksek kaldıraç sadece küçük pozisyon
+        # büyüklüğüne izin verir ve o küçük dilim genelde düşük bakım marjına
+        # sahiptir -- bu yüzden kaldıraç arttıkça bakım marjı azalıyor (5x'te
+        # %0.40'tan 100x'te %0.50'ye kadar YÜKSELMİYOR, tam tersi mantık
+        # yerine 1/kaldıraç'ın güvenli bir payla altında kalacak şekilde
+        # tutuluyor). delta_kumeleri_hesapla içinde ayrıca bir güvenlik payı
+        # (kucultme_katsayisi) uygulanıyor, bu tablo yanlış girilse bile.
+        "bakim_marji": {"5": 0.0040, "10": 0.0050, "25": 0.0100, "50": 0.0100, "100": 0.0050},
+        # Funding, extreme_pct eşiğinin kaç katına ulaşınca kayma tavana (max_kaydirma_orani)
+        # otursun (bu katın ötesinde kayma artmaya devam etmez, sabitlenir).
+        "siddet_tavan_kati": 3.0,
+        # En ekstrem durumda, taban ağırlığın en fazla ne kadarı düşük kaldıraçtan
+        # (5x/10x) yüksek kaldıraca (50x/100x) kayabilir (0.5 = ağırlığın yarısı).
+        "max_kaydirma_orani": 0.5
     }
 }
 
