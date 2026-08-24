@@ -236,14 +236,30 @@ KATMANLAR = {
 }
 PENCERELER = (12, 24)  # saat
 
+def format_usd_kisaltma(deger):
+    """Dolar değerini okunaklı kısaltmayla döndürür -- 1 milyar+ için 2 ondalık
+    ve 'B' (ör. '22.74B'), 1 milyon+ için 1 ondalık ve 'M' (ör. '24.2M'),
+    1 bin+ için 1 ondalık ve 'K', altında ise tam sayı formatında."""
+    deger = abs(deger)
+    if deger >= 1_000_000_000:
+        return f"{deger/1_000_000_000:.2f}B"
+    if deger >= 1_000_000:
+        return f"{deger/1_000_000:.1f}M"
+    if deger >= 1_000:
+        return f"{deger/1_000:.1f}K"
+    return f"{deger:,.0f}"
+
 def tum_haritalari_hesapla(db_path=None):
     """Tüm katman × pencere kombinasyonlarını (linear/inverse × 12s/24s = 4 harita)
     tek çağrıda hesaplar. db.py'den geçmişi okur (main.py'nin yazdığı canlı
     veri), her kombinasyon için pencere_kumeleri_biriktir'i çağırır.
 
     Dönüş: {
-      'linear':  {12: {(fiyat, yon): miktar, ...}, 24: {...}},
-      'inverse': {12: {...}, 24: {...}},
+      'katmanlar': {
+        'linear':  {12: {(fiyat, yon): miktar, ...}, 24: {...}},
+        'inverse': {12: {...}, 24: {...}},
+      },
+      'guncel_oi': {'linear': <şu anki linear OI, BTC>, 'inverse': <şu anki inverse OI, BTC>},
     }
     Yeterli veri yoksa (ör. oi_linear/inverse_btc kolonları henüz boşsa, ya da
     pencere kadar geçmiş birikmemişse) ilgili harita boş sözlük olarak döner --
@@ -252,27 +268,72 @@ def tum_haritalari_hesapla(db_path=None):
     from db import load_history, DB_FILE
     df = load_history(db_path or DB_FILE)
 
-    sonuc = {}
+    katmanlar = {}
+    guncel_oi = {}
     for katman_adi, oi_kolonu in KATMANLAR.items():
-        sonuc[katman_adi] = {}
+        katmanlar[katman_adi] = {}
         for saat in PENCERELER:
-            sonuc[katman_adi][saat] = pencere_kumeleri_biriktir(
+            katmanlar[katman_adi][saat] = pencere_kumeleri_biriktir(
                 df, saat_penceresi=saat, oi_kolonu=oi_kolonu, temizleme_aktif=True
             )
-    return sonuc
+        if not df.empty and oi_kolonu in df.columns:
+            son_deger = df[oi_kolonu].iloc[-1]
+            guncel_oi[katman_adi] = float(son_deger) if pd.notna(son_deger) else None
+        else:
+            guncel_oi[katman_adi] = None
 
-def harita_ozeti_yazdir(haritalar, guncel_fiyat=None):
+    return {'katmanlar': katmanlar, 'guncel_oi': guncel_oi}
+
+def harita_ozeti_yazdir(sonuc, guncel_fiyat=None):
     """tum_haritalari_hesapla çıktısını terminale okunaklı özet olarak basar --
-    her katman/pencere için küme sayısı, toplam miktar ve (varsa) en büyük 3
-    kümeyi gösterir. Hızlı gözle kontrol / main.py'ye entegrasyon öncesi debug
-    amaçlı."""
-    for katman_adi, pencereler in haritalar.items():
+    her katman için şu anki toplam OI'yi (BTC + $ kısaltmalı), sonra her
+    katman/pencere için küme sayısı, toplam miktar (BTC + $ kısaltmalı) ve
+    (varsa) en büyük 3 kümeyi (BTC + $ kısaltmalı) gösterir. guncel_fiyat
+    verilmezse $ dönüşümleri ve mesafe (%) bilgisi atlanır. Hızlı gözle
+    kontrol / main.py'ye entegrasyon öncesi debug amaçlı."""
+    katmanlar = sonuc['katmanlar']
+    guncel_oi = sonuc.get('guncel_oi', {})
+
+    for katman_adi, pencereler in katmanlar.items():
+        oi_btc = guncel_oi.get(katman_adi)
+        if oi_btc is not None and guncel_fiyat:
+            oi_usd = oi_btc * guncel_fiyat
+            print(f"\n=== {katman_adi.upper()} — şu anki toplam OI: ${format_usd_kisaltma(oi_usd)} ===")
+        elif oi_btc is not None:
+            print(f"\n=== {katman_adi.upper()} — şu anki toplam OI: {oi_btc:,.2f} BTC (fiyat alınamadı, $ dönüşümü yapılamadı) ===")
+        else:
+            print(f"\n=== {katman_adi.upper()} — şu anki toplam OI: veri yok ===")
+
         for saat, kumeler in pencereler.items():
-            toplam = sum(kumeler.values())
-            print(f"  📍 [{katman_adi} / {saat}s] {len(kumeler)} küme, toplam {toplam:,.2f} BTC")
+            toplam_btc = sum(kumeler.values())
+            toplam_gosterim = f"${format_usd_kisaltma(toplam_btc * guncel_fiyat)}" if guncel_fiyat else f"{toplam_btc:,.2f} BTC (fiyat yok)"
+            print(f"  📍 [{saat}s] {len(kumeler)} küme, toplam {toplam_gosterim}")
             if not kumeler:
                 continue
             en_buyukler = sorted(kumeler.items(), key=lambda kv: -kv[1])[:3]
             for (fiyat, yon), miktar in en_buyukler:
                 mesafe = f" ({'-' if yon=='long' else '+'}{abs(fiyat-guncel_fiyat)/guncel_fiyat*100:.2f}%)" if guncel_fiyat else ""
-                print(f"      {yon:<6} ${fiyat:>10,.2f}{mesafe}  {miktar:,.2f} BTC")
+                miktar_gosterim = f"${format_usd_kisaltma(miktar * guncel_fiyat)}" if guncel_fiyat else f"{miktar:,.2f} BTC (fiyat yok)"
+                print(f"      {yon:<6} ${fiyat:>10,.2f}{mesafe}  {miktar_gosterim}")
+
+# ==========================================
+# DOĞRUDAN ÇALIŞTIRMA (python likidasyon.py)
+# ==========================================
+if __name__ == "__main__":
+    from borsa import get_btc_price
+
+    print("📍 Likidasyon haritaları hesaplanıyor (mevcut oi_funding_history.db'den, linear/inverse × 12s/24s)...\n")
+    guncel_fiyat = get_btc_price()
+    if guncel_fiyat <= 0:
+        print("  ⚠️ Güncel fiyat çekilemedi, $ dönüşümü ve mesafe (%) bilgisi olmadan devam ediliyor.")
+        guncel_fiyat = None
+
+    sonuc = tum_haritalari_hesapla()
+    harita_ozeti_yazdir(sonuc, guncel_fiyat=guncel_fiyat)
+
+    toplam_kume = sum(len(k) for pencereler in sonuc['katmanlar'].values() for k in pencereler.values())
+    if toplam_kume == 0:
+        print("\n  ℹ️ Hiçbir haritada küme yok -- muhtemelen DB'de henüz linear/inverse OI "
+              "verisi biriken yeterli geçmiş (en az birkaç saat) yok, ya da botu daha "
+              "yeni bu sürüme güncellediysen eski satırlarda bu kolonlar boş. Bot birkaç "
+              "saat daha çalışsın, sonra tekrar dene.")

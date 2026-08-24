@@ -10,7 +10,7 @@ from sinyal import (
     _periyot_cvd_degisimi, compute_adaptive_tf_thresholds,
     son_tf_genel_durumlar, sinyal_performans_guncelle,
 )
-from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_binance_cvd
+from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_toplam_cvd
 from telegram import should_send_telegram, send_telegram_message, build_telegram_report
 
 # ==========================================
@@ -196,8 +196,8 @@ def run_snapshot_and_report():
 
     # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
-    cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
-    cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
+    cvd_spot = get_toplam_cvd('spot', 'BTCUSDT')   # Binance spot + OKX spot
+    cvd_perp = get_toplam_cvd('futures', 'BTCUSDT')  # sadece Binance (OKX contracts birim doğrulaması bekliyor)
 
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
@@ -238,8 +238,9 @@ def run_continuous(interval_minutes=15):
     debug_interval = debug_cfg.get('interval_seconds', 30)
 
     if debug_on:
-        print(f"⚠️  DEBUG MODU AKTİF"
-              f" her {debug_interval} saniyede bir ")
+        print(f"⚠️  DEBUG MODU AKTİF (config.json -> debug.enabled=true): "
+              f":00/:15/:30/:45 sınırı BEKLENMEYECEK, her {debug_interval} saniyede bir "
+              f"snapshot alınacak. Bitince config.json'da debug.enabled'ı false yap.")
     else:
         print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
 

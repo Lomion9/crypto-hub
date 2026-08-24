@@ -5,6 +5,20 @@ from datetime import datetime, timezone
 
 from config import CONFIG
 
+def _usd_kisaltma(deger):
+    """Dolar değerini okunaklı kısaltmayla döndürür -- likidasyon.py'deki
+    format_usd_kisaltma ile aynı mantık, döngüsel import olmaması için burada
+    ayrıca (küçük olduğu için) tutuluyor. 1 milyar+ -> 'B', 1 milyon+ -> 'M',
+    1 bin+ -> 'K'."""
+    deger = abs(deger)
+    if deger >= 1_000_000_000:
+        return f"{deger/1_000_000_000:.2f}B"
+    if deger >= 1_000_000:
+        return f"{deger/1_000_000:.1f}M"
+    if deger >= 1_000:
+        return f"{deger/1_000:.1f}K"
+    return f"{deger:,.0f}"
+
 # ==========================================
 # 1. STANDART CCXT İLE ÇALIŞANLAR
 # ==========================================
@@ -145,6 +159,57 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
         print(f"  ❌ Binance CVD Hata ({market_type}): {e}")
         return 0.0
 
+def get_okx_spot_cvd(ccy='BTC'):
+    """OKX'in ayrı istatistik endpoint'inden (rubik/stat/taker-volume) SPOT
+    piyasası için bugünkü (UTC 00:00'dan itibaren) kümülatif CVD'yi hesaplar.
+    Binance'in kline'ının aksine OKX'in normal mum verisinde taker alım/satım
+    ayrımı YOK -- bu yüzden ayrı bir istatistik endpoint'i kullanılıyor.
+    SADECE SPOT: bu endpoint'in 'CONTRACTS' (perp/futures) modu muhtemelen
+    kontrat sayısı cinsinden dönüyor (BTC değil), doğru çevirmek için OKX'in
+    kontrat çarpanını (ctVal) ayrıca sorgulamak gerekir -- bu canlı doğrulanana
+    kadar eklenmedi (bkz. sohbet notu). SPOT modu ise doğrudan BTC (taban
+    varlık) cinsinden olduğu için Binance'in spot CVD'siyle güvenle toplanabilir.
+    period='1H' kullanılıyor (Binance'teki interval='1h' ile aynı mantık)."""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        day_start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        res = requests.get(
+            "https://www.okx.com/api/v5/rubik/stat/taker-volume",
+            params={'ccy': ccy, 'instType': 'SPOT', 'period': '1H'},
+            timeout=10
+        ).json()
+
+        veri = res.get('data', [])
+        if not isinstance(veri, list) or not veri:
+            print(f"  ❌ OKX Spot CVD Hata: beklenmeyen cevap -> {res}")
+            return 0.0
+
+        cvd_btc = 0.0
+        for satir in veri:
+            # OKX dokümantasyonuna göre sıra: [ts, sellVol, buyVol]
+            ts_ms, sell_vol, buy_vol = int(satir[0]), float(satir[1]), float(satir[2])
+            if ts_ms < int(day_start_utc.timestamp() * 1000):
+                continue  # sadece bugünün barları
+            cvd_btc += (buy_vol - sell_vol)
+        return cvd_btc
+    except Exception as e:
+        print(f"  ❌ OKX Spot CVD Hata: {e}")
+        return 0.0
+
+def get_toplam_cvd(market_type='spot', symbol='BTCUSDT', okx_ccy='BTC'):
+    """Binance + (varsa) OKX spot CVD'sini toplar. market_type='spot' ise
+    Binance spot + OKX spot (ikisi de BTC cinsinden, güvenle toplanabilir).
+    market_type='futures' ise SADECE Binance futures döner -- OKX'in contracts
+    (perp) CVD'si birim doğrulaması yapılmadan eklenmedi (bkz. get_okx_spot_cvd
+    docstring'i). OKX çağrısı başarısız olursa (0.0 dönerse) sessizce sadece
+    Binance'in değeriyle devam eder, tüm satırı iptal etmez."""
+    binance_cvd = get_binance_cvd(market_type=market_type, symbol=symbol)
+    if market_type == 'spot':
+        okx_cvd = get_okx_spot_cvd(ccy=okx_ccy)
+        return binance_cvd + okx_cvd
+    return binance_cvd
+
 def fetch_with_retry(fetch_func, *args, retries=2, delay=3, **kwargs):
     """Bir borsa çağrısı geçici bir hatadan (network blip, rate limit, borsanın
     anlık kesintisi vb.) dolayı 0 dönerse, tüm satırı 'başarısız' loglamadan önce
@@ -196,6 +261,13 @@ def get_btc_ohlc_15m():
 # ==========================================
 def get_global_macro_data():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🌐 USDT ve USD Tahtalarından Makro Veriler Toplanıyor...")
+
+    # Terminal çıktısında OI'yi BTC yerine $ (kısaltmalı) göstermek için fiyat
+    # gerekiyor -- bu fonksiyonun dönüş değerini/DB'ye yazılan hiçbir şeyi
+    # etkilemez, sadece görüntüleme amaçlı. Fiyat çekilemezse (0 dönerse) BTC'ye
+    # düşülür (aşağıdaki print'lerde ayrıca kontrol ediliyor).
+    _terminal_fiyat = get_btc_price()
+
     markets = {
         'Binance_USDT': fetch_with_retry(get_standard_ccxt_data, 'binance', 'BTC/USDT:USDT'),
         'Binance_USD': fetch_with_retry(get_custom_binance_usd_data),
@@ -239,7 +311,8 @@ def get_global_macro_data():
         normalized[borsa] = (oi, funding_8h)
         if oi > 0:
             etiket = "Funding(8s, gerçek)" if (borsa == 'Hyperliquid' and hl_funding_8h_real is not None) else "Funding(8s)"
-            print(f"  ✅ {borsa.ljust(15)}: OI = {oi:>10,.2f} BTC  |  {etiket} = %{funding_8h:+.4f}")
+            oi_gosterim = f"${_usd_kisaltma(oi * _terminal_fiyat)}" if _terminal_fiyat > 0 else f"{oi:,.2f} BTC (fiyat yok)"
+            print(f"  ✅ {borsa.ljust(15)}: OI = {oi_gosterim:>10}  |  {etiket} = %{funding_8h:+.4f}")
         else:
             failed_borsalar.append(borsa)
             print(f"  ❌ {borsa.ljust(15)}: Bağlantı Sağlanamadı / Veri 0")
@@ -263,7 +336,10 @@ def get_global_macro_data():
     )
 
     print("-" * 60)
-    print(f"  🌍 KÜRESEL TOPLAM OI         : {total_oi_btc:,.2f} BTC")
+    if _terminal_fiyat > 0:
+        print(f"  🌍 KÜRESEL TOPLAM OI         : ${_usd_kisaltma(total_oi_btc * _terminal_fiyat)}")
+    else:
+        print(f"  🌍 KÜRESEL TOPLAM OI         : {total_oi_btc:,.2f} BTC (fiyat yok, $ dönüşümü yapılamadı)")
     print(f"  ⚖️ AĞIRLIKLI FONLAMA ORANI (8s): %{global_weighted_funding:+.4f}\n")
 
     return total_oi_btc, global_weighted_funding, failed_borsalar, oi_linear_btc, oi_inverse_btc
