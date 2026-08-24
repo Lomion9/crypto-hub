@@ -65,6 +65,9 @@ def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_
     lines.append("🎯 <b>TIMEFRAME BAZLI SİNYAL DURUMU</b>")
     for tf, sonuc in tf_sonuclari.items():
         lines.append(f"[{tf}] {sonuc['genel_durum']}")
+        hedef = sonuc.get('hedef')
+        if hedef:
+            lines.append(f"    🎯 Hedef: ${hedef['hedef_fiyat']:,.2f} ({hedef['hedef_miktar_btc']:,.2f} BTC)  |  TP: ${hedef['tp']:,.2f}")
     if kapanan_islemler:
         lines.append("")
         lines.append("💰 <b>KAPANAN SİNYALLER</b>")

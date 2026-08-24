@@ -319,6 +319,52 @@ def harita_ozeti_yazdir(sonuc, guncel_fiyat=None):
 # ==========================================
 # DOĞRUDAN ÇALIŞTIRMA (python likidasyon.py)
 # ==========================================
+
+# ==========================================
+# SİNYALE HEDEF VERME
+# ==========================================
+def hedef_belirle(yon, tp_tampon=200, saat_penceresi=12, db_path=None):
+    """Bir sinyalin yönüne ('long' ya da 'short') göre, o yönün KARŞITI olan
+    likidasyon kümelerinden (long sinyalse ÜSTTEKİ short kümeleri, short sinyalse
+    ALTTAKİ long kümeleri -- fiyat o yöne gidince karşı taraf sıkışıp fiyatı o
+    seviyeye çeker) en büyüğünü bulup hedef ve take-profit üretir.
+
+    Linear ve inverse katmanları BİRLEŞTİRİLİR (aynı fiyat+yön'e denk gelen
+    miktarlar toplanır) -- kullanıcı bu ayrımı hedef belirlerken önemsemiyor,
+    tek bir havuzdan en büyük kümeye bakılıyor. Sadece {saat_penceresi} saatlik
+    pencere kullanılır (24s'e düşme YOK -- 12s'te pratikte her zaman en az bir
+    küme bulunur, bulunamaması istisnai bir durum sayılır).
+
+    Dönüş: {'hedef_fiyat': ..., 'hedef_miktar_btc': ..., 'tp': ...,
+    'yon': yon} ya da (12s penceresinde hiç karşıt küme yoksa, istisnai durum)
+    None."""
+    from db import load_history, DB_FILE
+    df = load_history(db_path or DB_FILE)
+
+    birlesik = {}
+    for oi_kolonu in KATMANLAR.values():
+        kumeler = pencere_kumeleri_biriktir(df, saat_penceresi=saat_penceresi, oi_kolonu=oi_kolonu, temizleme_aktif=True)
+        for anahtar, miktar in kumeler.items():
+            birlesik[anahtar] = birlesik.get(anahtar, 0.0) + miktar
+
+    hedef_yon = 'short' if yon == 'long' else 'long'
+    adaylar = {anahtar: miktar for anahtar, miktar in birlesik.items() if anahtar[1] == hedef_yon}
+
+    if not adaylar:
+        return None
+
+    (hedef_fiyat, _), hedef_miktar = max(adaylar.items(), key=lambda kv: kv[1])
+
+    tp = hedef_fiyat - tp_tampon if yon == 'long' else hedef_fiyat + tp_tampon
+
+    return {
+        'hedef_fiyat': hedef_fiyat,
+        'hedef_miktar_btc': hedef_miktar,
+        'tp': tp,
+        'yon': yon,
+    }
+
+
 if __name__ == "__main__":
     from borsa import get_btc_price
 

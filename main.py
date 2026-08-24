@@ -6,12 +6,13 @@ from datetime import datetime, timedelta, timezone
 from config import CONFIG
 from db import DB_FILE, HISTORY_FILE, VERI_COLS, _init_db, load_history
 from sinyal import (
-    funding_status, _periyot_durumu, cvd_durumu, genel_durum,
+    funding_status, _periyot_durumu, cvd_durumu, genel_durum, _islem_yonu,
     _periyot_cvd_degisimi, compute_adaptive_tf_thresholds,
     son_tf_genel_durumlar, sinyal_performans_guncelle,
 )
-from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_toplam_cvd
+from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_binance_cvd
 from telegram import should_send_telegram, send_telegram_message, build_telegram_report
+from likidasyon import hedef_belirle, tum_haritalari_hesapla, harita_ozeti_yazdir
 
 # ==========================================
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
@@ -72,6 +73,11 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     kapanan_islemler = {}
     adaptif = compute_adaptive_tf_thresholds(df_gecmis)
     mevcut_saat, mevcut_dakika = now.hour, now.minute
+    # Aynı turda birden fazla tf aynı yöne (ör. hem 1sa hem 4sa 'long') işaret
+    # edebilir -- hedef_belirle her seferinde DB'yi baştan taradığı için,
+    # yön başına en fazla BİR kez çağırıp sonucu bu turun geri kalanında
+    # tekrar kullanıyoruz (gereksiz tekrar hesaplama/DB okuması yapmamak için).
+    hedef_onbellek = {}
 
     for tf, tf_conf in CONFIG['timeframes'].items():
         sinir_saatleri = tf_conf.get('sinir_saatleri')
@@ -119,7 +125,23 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf,
                              'genel_durum': genel, 'telegram_uygun': telegram_uygun}
 
-        if genel != "Veri Bekleniyor":
+        # HEDEF/TP: sadece 1sa ve üzeri, yönü belli (İşlem Açma/Veri Bekleniyor
+        # dışında) sinyaller için -- 15dk artık kendi başına bir sinyal değil,
+        # bu yüzden hedef üretilmiyor (yon her zaman None döner, atlanır).
+        if tf != '15dk' and genel != "Veri Bekleniyor":
+            yon = _islem_yonu(genel)
+            if yon:
+                if yon not in hedef_onbellek:
+                    hedef_onbellek[yon] = hedef_belirle(yon, db_path=path)
+                tf_sonuclari[tf]['hedef'] = hedef_onbellek[yon]
+
+        # 15dk için AÇIK/KAPALI sinyal takibi (aktif_islem_15dk / sinyal_15dk)
+        # artık yapılmıyor -- 15dk sadece 1sa'nın confirm_kaynak'ı olarak
+        # (durum_15dk üzerinden) bir KONTROL NOKTASI, kendi başına izlenen/
+        # kapatılan bir sinyal değil. Her farklı genel_durum'da anında
+        # "kapanmış" sayılması hem gürültülüydü hem de kâr/zarar takibi
+        # anlamsızdı (15dk'da gerçek bir işlem açılmıyor zaten).
+        if tf != '15dk' and genel != "Veri Bekleniyor":
             kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str, tf_conf.get('kapanis_esigi', 3))
             if kapanan:
                 kapanan_islemler[tf] = kapanan
@@ -134,6 +156,11 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
             continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
+        hedef = s.get('hedef')
+        if hedef:
+            print(f"        🎯 Hedef: ${hedef['hedef_fiyat']:,.2f} ({hedef['hedef_miktar_btc']:,.2f} BTC likidite)  |  TP: ${hedef['tp']:,.2f}")
+        elif hedef is None and 'hedef' in s:
+            print(f"        ⚠️ Hedef bulunamadı (12s penceresinde karşıt yönde küme yok)")
     for tf, k in kapanan_islemler.items():
         print(f"  💰 [{tf}] SİNYAL KAPANDI: {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
 
@@ -196,14 +223,24 @@ def run_snapshot_and_report():
 
     # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
-    cvd_spot = get_toplam_cvd('spot', 'BTCUSDT')   # Binance spot + OKX spot
-    cvd_perp = get_toplam_cvd('futures', 'BTCUSDT')  # sadece Binance (OKX contracts birim doğrulaması bekliyor)
+    cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
+    cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
 
     print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
     print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
 
     sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani, ohlc=ohlc,
                           oi_linear=oi_linear, oi_inverse=oi_inverse)
+
+    # Likidasyon haritalarını bu turun yeni yazılan satırıyla birlikte tazele
+    # ve terminale bas -- yönlü bir sinyal olsun olmasın HER 15dk'da bir
+    # çalışır, böylece harita her zaman güncel kalır (hedef_belirle zaten
+    # DB'den taze okuyor, bu sadece görünürlük/log amaçlı).
+    try:
+        likidasyon_sonucu = tum_haritalari_hesapla()
+        harita_ozeti_yazdir(likidasyon_sonucu, guncel_fiyat=price)
+    except Exception as e:
+        print(f"  ⚠️ Likidasyon haritası hesaplanamadı: {e}")
 
     report_text = build_telegram_report(
         failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
@@ -238,9 +275,8 @@ def run_continuous(interval_minutes=15):
     debug_interval = debug_cfg.get('interval_seconds', 30)
 
     if debug_on:
-        print(f"⚠️  DEBUG MODU AKTİF (config.json -> debug.enabled=true): "
-              f":00/:15/:30/:45 sınırı BEKLENMEYECEK, her {debug_interval} saniyede bir "
-              f"snapshot alınacak. Bitince config.json'da debug.enabled'ı false yap.")
+        print(f"⚠️  DEBUG MODU AKTİF"
+              f" her {debug_interval} saniyede bir ")
     else:
         print(f"Başlatılıyor: Her saatin {interval_minutes} dakikalık sabit dilimlerinde (örn. :00/:15/:30/:45) çalışılacak.")
 
