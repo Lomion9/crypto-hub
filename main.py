@@ -12,7 +12,7 @@ from sinyal import (
 )
 from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_binance_cvd
 from telegram import should_send_telegram, send_telegram_message, build_telegram_report
-from likidasyon import hedef_belirle, tum_haritalari_hesapla, harita_ozeti_yazdir
+from likidasyon import hedef_belirle, tum_haritalari_hesapla, en_buyuk_likidasyonlar, format_usd_kisaltma
 
 # ==========================================
 # 4. ZAMAN SERİSİ VE SİNYAL JENERATÖRÜ
@@ -105,17 +105,16 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         )
 
         # TELEGRAM KONFİRMASYON ŞARTI: 15dk kendi sinyalini asla doğrudan Telegram'a
-        # göndermez (telegram_uygun=False sabit). Diğer tf'ler için: kendi
-        # confirm_kaynak tf'inden son confirm_n adet genel_durum kaydından (bu
-        # turda kaynak tf için yeni yazılan kayıt varsa o da dahil) en az biri, BU
-        # tf'in genel_durum'uyla birebir aynı olmalı — yoksa mesaj atlanır (ama
-        # durum_{tf} tablosuna ve genel akışa normal şekilde yazılmaya devam eder).
-        # Zincir: 1sa/2sa -> son 4/8 adet 15dk durumu, 4sa/8sa -> son 4/8 adet 1sa
-        # durumu, 24sa -> son 6 adet 4sa durumu.
+        # göndermez (telegram_uygun=False sabit). 4sa kendi sinyalini bağımsız
+        # kullanır; 1sa ile uyumlu olma şartı yoktur. Diğer tf'ler için kendi
+        # confirm_kaynak tf'inden son confirm_n adet durumdan en az biri, BU
+        # tf'in genel_durum'uyla aynı olmalıdır.
         if tf == '15dk':
             telegram_uygun = False
         elif genel == "Veri Bekleniyor":
             telegram_uygun = False
+        elif tf == '4sa':
+            telegram_uygun = True
         else:
             kaynak_tf = tf_conf['confirm_kaynak']
             kaynak_n = tf_conf['confirm_n']
@@ -248,7 +247,11 @@ def print_trend_report(df):
 
 def run_snapshot_and_report():
     baslangic_zamani = datetime.now(timezone(timedelta(hours=3)))
-    total_oi, global_funding, failed_borsalar, oi_linear, oi_inverse = get_global_macro_data()
+    # Veri toplama sırasında ayrıntılı borsa loglarını terminal özetinden gizle.
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        total_oi, global_funding, failed_borsalar, oi_linear, oi_inverse = get_global_macro_data()
 
     if failed_borsalar:
         print(f"  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — veri alınamayan borsa(lar): {', '.join(failed_borsalar)}")
@@ -266,16 +269,9 @@ def run_snapshot_and_report():
     else:
         price = ohlc['close']
 
-    print(f"  🕯️  15dk Mum (Binance) -> Açılış: ${ohlc['open']:,.2f}  Yüksek: ${ohlc['high']:,.2f}  "
-          f"Düşük: ${ohlc['low']:,.2f}  Kapanış: ${ohlc['close']:,.2f}")
-
     # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 CVD Verileri Hesaplanıyor (Bugün 00:00 UTC'den İtibaren)...")
     cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
     cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
-
-    print(f"  📊 Spot CVD (bugün) : {cvd_spot:+.2f} BTC")
-    print(f"  📊 Perp CVD (bugün) : {cvd_perp:+.2f} BTC\n")
 
     sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani, ohlc=ohlc,
                           oi_linear=oi_linear, oi_inverse=oi_inverse)
@@ -286,9 +282,9 @@ def run_snapshot_and_report():
     # DB'den taze okuyor, bu sadece görünürlük/log amaçlı).
     try:
         likidasyon_sonucu = tum_haritalari_hesapla()
-        harita_ozeti_yazdir(likidasyon_sonucu, guncel_fiyat=price)
+        buyuk_likidasyonlar = en_buyuk_likidasyonlar(likidasyon_sonucu, guncel_fiyat=price)
     except Exception as e:
-        print(f"  ⚠️ Likidasyon haritası hesaplanamadı: {e}")
+        buyuk_likidasyonlar = {'long': None, 'short': None}
 
     report_text = build_telegram_report(
         failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp,
@@ -296,11 +292,24 @@ def run_snapshot_and_report():
     )
     if should_send_telegram(sonuc['tf_sonuclari']):
         send_telegram_message(report_text)
-    else:
-        print("  ⏳ Hiçbir timeframe'de yeni sinyal yok, Telegram mesajı atlanıyor.")
 
     df = load_history()
-    print_trend_report(df)
+    print("\n===== ANLIK ÖZET =====")
+    print(f"Fiyat : ${price:,.2f}")
+    print(f"OI    : ${format_usd_kisaltma(total_oi * price)} ({total_oi:,.2f} BTC)")
+    print(f"Funding: %{global_funding:+.4f}")
+    print(f"CVD   : Spot {cvd_spot:+.2f} BTC | Perp {cvd_perp:+.2f} BTC")
+    for yon, etiket in [('long', 'Long likidasyonu'), ('short', 'Short likidasyonu')]:
+        likidasyon = buyuk_likidasyonlar[yon]
+        if likidasyon:
+            print(f"{etiket}: ${format_usd_kisaltma(likidasyon['miktar_usd'])} ${likidasyon['fiyat']:,.2f}")
+        else:
+            print(f"{etiket}: Veri yok")
+
+    print("\n===== ANLIK SİNYAL DURUMU =====")
+    for tf, sinyal in sonuc['tf_sonuclari'].items():
+        print(f"[{tf}] OI: {sinyal['oi_durum']} | Fiyat: {sinyal['fiyat_durum']} | "
+              f"CVD: {sinyal['cvd_durum']} | Sinyal: {sinyal['genel_durum']}")
     return df
 
 def _sonraki_sinira_kadar_bekle(interval_minutes):

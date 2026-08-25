@@ -316,6 +316,25 @@ def harita_ozeti_yazdir(sonuc, guncel_fiyat=None):
                 miktar_gosterim = f"${format_usd_kisaltma(miktar * guncel_fiyat)}" if guncel_fiyat else f"{miktar:,.2f} BTC (fiyat yok)"
                 print(f"      {yon:<6} ${fiyat:>10,.2f}{mesafe}  {miktar_gosterim}")
 
+def en_buyuk_likidasyonlar(sonuc, guncel_fiyat=None):
+    """Tüm katman ve pencereler içinden en büyük long/short kümeleri döndürür."""
+    en_buyuk = {'long': None, 'short': None}
+    for katman_adi, pencereler in sonuc.get('katmanlar', {}).items():
+        for saat, kumeler in pencereler.items():
+            for (fiyat, yon), miktar_btc in kumeler.items():
+                mevcut = en_buyuk[yon]
+                if mevcut is None or miktar_btc > mevcut['miktar_btc']:
+                    mevcut = {
+                        'katman': katman_adi,
+                        'pencere': saat,
+                        'fiyat': float(fiyat),
+                        'miktar_btc': float(miktar_btc),
+                    }
+                    if guncel_fiyat:
+                        mevcut['miktar_usd'] = mevcut['miktar_btc'] * guncel_fiyat
+                    en_buyuk[yon] = mevcut
+    return en_buyuk
+
 # ==========================================
 # DOĞRUDAN ÇALIŞTIRMA (python likidasyon.py)
 # ==========================================

@@ -4,14 +4,14 @@
       "periods": 1,
       "oi_pct": 0.31,
       "price_pct": 0.22,
-      "kapanis_esigi": 3,
+      "kapanis_esigi": 4,
       "sinir_saatleri": null
     },
     "1sa": {
       "periods": 4,
       "oi_pct": 0.88,
       "price_pct": 0.43,
-      "kapanis_esigi": 2,
+      "kapanis_esigi": 3,
       "sinir_saatleri": [
         0,
         1,
@@ -45,7 +45,7 @@
       "periods": 8,
       "oi_pct": 1.65,
       "price_pct": 0.72,
-      "kapanis_esigi": 1,
+      "kapanis_esigi": 2,
       "sinir_saatleri": [
         1,
         3,
@@ -67,7 +67,7 @@
       "periods": 16,
       "oi_pct": 3.08,
       "price_pct": 1.08,
-      "kapanis_esigi": 1,
+      "kapanis_esigi": 2,
       "sinir_saatleri": [
         23,
         3,
