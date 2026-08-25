@@ -142,59 +142,149 @@ def _islem_yonu(genel_durum_deger):
         return 'short'
     return None
 
-def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3):
-    row = conn.execute(f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac FROM aktif_islem_{tf} WHERE id=1").fetchone()
+# TRAP KATEGORİLERİ -- bu ikisi tespit edildiğinde pozisyon HEMEN açılmaz.
+# Long Trap: küçük yatırımcı fiyat yükseldikçe short açıyor, market maker onları
+# sıkıştırarak fiyatı yukarıdaki büyük likidite hedefine kadar sürüklüyor --
+# _islem_yonu bunun için 'short' döner (tuzak TAMAMLANDIKTAN sonraki gerçek
+# yön) ama tuzaklanan/sürüklenen yön aslında 'long' (fiyatın gittiği yön).
+# Short Trap bunun aynası: _islem_yonu 'long' döner, tuzaklanan yön 'short'.
+TRAP_KATEGORILERI = {"Long Trap": "long", "Short Trap": "short"}
 
-    def durumu_kaydet(aktif, sayac):
+def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3, tp=None,
+                                bekleme_tetik_fiyat=None):
+    """tp: yeni AÇILACAK bir pozisyon için (bekleme tetiklenip pozisyon
+    açıldığında dahil) hedef_belirle(gerçek_yön)'den gelen TP fiyatı.
+
+    bekleme_tetik_fiyat: genel_durum_deger bir TRAP kategorisiyse (Long Trap/
+    Short Trap), hedef_belirle(tuzaklanan_yön)'den gelen tetik noktası --
+    tuzağın TAMAMLANMASI için fiyatın (tuzaklanan yönde) ulaşması beklenen
+    seviye. Trap kategorileri tespit edildiğinde pozisyon hemen açılmaz;
+    aktif_bekleme_{tf}'e kaydedilip bu tetik noktasına ulaşılması beklenir --
+    ulaşıldığında GERÇEK (ters yönlü) pozisyon açılır, TP'si yukarıdaki tp
+    parametresidir. Bekleme süresiz sürer (aynı trap devam ettikçe her turda
+    tetik_fiyat taze veriyle güncellenir); trap sinyali kapanis_esigi kadar
+    art arda farklı bir şeye dönüşürse bekleme iptal edilir."""
+
+    def aktif_durumu_kaydet(aktif, sayac):
         conn.execute(f"DELETE FROM aktif_islem_{tf} WHERE id=1")
         if aktif is not None:
             conn.execute(
-                f"INSERT INTO aktif_islem_{tf} (id, genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac) VALUES (1,?,?,?,?,?)",
-                (aktif['genel_durum'], aktif['giris_fiyat'], aktif['giris_tarih'], aktif['giris_saat'], sayac)
+                f"INSERT INTO aktif_islem_{tf} (id, genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac, hedef_tp) VALUES (1,?,?,?,?,?,?)",
+                (aktif['genel_durum'], aktif['giris_fiyat'], aktif['giris_tarih'], aktif['giris_saat'], sayac, aktif.get('hedef_tp'))
             )
 
-    def yeni_baslat(gd):
-        return {'genel_durum': gd, 'giris_fiyat': price, 'giris_tarih': tarih_str, 'giris_saat': saat_str}
+    def yeni_baslat(gd, giris_fiyati=None):
+        return {'genel_durum': gd, 'giris_fiyat': giris_fiyati if giris_fiyati is not None else price,
+                'giris_tarih': tarih_str, 'giris_saat': saat_str, 'hedef_tp': tp}
+
+    def kapanisi_kaydet(aktif, cikis_fiyat, kapanis_tipi):
+        giris_fiyat = aktif['giris_fiyat']
+        yon = _islem_yonu(aktif['genel_durum'])
+        ham_degisim = (cikis_fiyat - giris_fiyat) / giris_fiyat * 100
+        kar_yuzde = -ham_degisim if yon == 'short' else ham_degisim
+
+        kapanan = {
+            'kapanis_tarih': tarih_str, 'kapanis_saat': saat_str,
+            'sinyal': aktif['genel_durum'], 'yon': yon or 'belirsiz',
+            'giris_tarih': aktif['giris_tarih'], 'giris_saat': aktif['giris_saat'],
+            'giris_fiyat': giris_fiyat, 'cikis_fiyat': cikis_fiyat, 'kar_yuzde': kar_yuzde,
+            'kapanis_tipi': kapanis_tipi,
+        }
+        conn.execute(
+            f"INSERT INTO sinyal_{tf} (kapanis_tarih, kapanis_saat, sinyal, yon, giris_tarih, giris_saat, giris_fiyat, cikis_fiyat, kar_yuzde, kapanis_tipi) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (kapanan['kapanis_tarih'], kapanan['kapanis_saat'], kapanan['sinyal'], kapanan['yon'],
+             kapanan['giris_tarih'], kapanan['giris_saat'], kapanan['giris_fiyat'], kapanan['cikis_fiyat'],
+             kapanan['kar_yuzde'], kapanan['kapanis_tipi'])
+        )
+        return kapanan
+
+    def bekleme_kaydet(genel_durum, tetik_fiyat, sayac):
+        conn.execute(f"DELETE FROM aktif_bekleme_{tf} WHERE id=1")
+        if genel_durum is not None:
+            conn.execute(
+                f"INSERT INTO aktif_bekleme_{tf} (id, genel_durum, tetik_fiyat, farkli_sayac) VALUES (1,?,?,?)",
+                (genel_durum, tetik_fiyat, sayac)
+            )
+
+    def yeni_sinyali_islem_baslat_veya_bekle(gd):
+        """Yeni bir sinyal geldiğinde (aktif_islem YOK): trap kategorisiyse
+        bekleme başlatır, değilse doğrudan pozisyon açar."""
+        if gd in TRAP_KATEGORILERI:
+            bekleme_kaydet(gd, bekleme_tetik_fiyat, 0)
+        elif not gd.startswith("İşlem Açma"):
+            aktif_durumu_kaydet(yeni_baslat(gd), 0)
+
+    # =========================================================
+    # AŞAMA 1 -- BEKLEME (TRAP) DURUMU VARSA ÖNCE ONU YÖNET
+    # =========================================================
+    bekleme_row = conn.execute(f"SELECT genel_durum, tetik_fiyat, farkli_sayac FROM aktif_bekleme_{tf} WHERE id=1").fetchone()
+    if bekleme_row is not None:
+        bek_genel, bek_tetik, bek_sayac = bekleme_row
+        bek_yon = TRAP_KATEGORILERI.get(bek_genel)  # tuzaklanan/sürüklenen yön
+
+        if genel_durum_deger == bek_genel:
+            # Trap hâlâ (ya da yeniden) doğrulanıyor -- tetik noktasını TAZE
+            # veriyle güncelle ("son gelen sinyalle tekrardan hesaplanır").
+            guncel_tetik = bekleme_tetik_fiyat if bekleme_tetik_fiyat is not None else bek_tetik
+            tetiklendi = (
+                (bek_yon == 'long' and price >= guncel_tetik) or
+                (bek_yon == 'short' and price <= guncel_tetik)
+            )
+            if tetiklendi:
+                bekleme_kaydet(None, None, 0)
+                aktif_durumu_kaydet(yeni_baslat(bek_genel, giris_fiyati=guncel_tetik), 0)
+                return None  # pozisyon yeni açıldı, henüz kapanış yok
+            bekleme_kaydet(bek_genel, guncel_tetik, 0)
+            return None
+        else:
+            bek_sayac += 1
+            if bek_sayac >= kapanis_esigi:
+                bekleme_kaydet(None, None, 0)  # trap iptal oldu, bekleme sona erdi
+                # AŞAĞI DEVAM ET -- aynı turda genel_durum_deger yeni bir
+                # pozisyon (ya da yeni bir bekleme) başlatabilir.
+            else:
+                bekleme_kaydet(bek_genel, bek_tetik, bek_sayac)
+                return None
+
+    # =========================================================
+    # AŞAMA 2 -- NORMAL AÇIK POZİSYON MANTIĞI
+    # =========================================================
+    row = conn.execute(
+        f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac, hedef_tp FROM aktif_islem_{tf} WHERE id=1"
+    ).fetchone()
 
     if row is None:
-        if not genel_durum_deger.startswith("İşlem Açma"):
-            durumu_kaydet(yeni_baslat(genel_durum_deger), 0)
+        yeni_sinyali_islem_baslat_veya_bekle(genel_durum_deger)
         return None
 
-    aktif = {'genel_durum': row[0], 'giris_fiyat': row[1], 'giris_tarih': row[2], 'giris_saat': row[3]}
+    aktif = {'genel_durum': row[0], 'giris_fiyat': row[1], 'giris_tarih': row[2], 'giris_saat': row[3], 'hedef_tp': row[5]}
     sayac = row[4]
 
+    # TP KONTROLÜ -- genel_durum hiç değişmemiş olsa bile, fiyat kayıtlı
+    # hedef_tp'ye (pozisyon lehine yönde) ulaştıysa pozisyon HEMEN kapanır.
+    aktif_yon = _islem_yonu(aktif['genel_durum'])
+    if aktif['hedef_tp'] is not None and aktif_yon is not None:
+        hedefe_ulasti = (
+            (aktif_yon == 'long' and price >= aktif['hedef_tp']) or
+            (aktif_yon == 'short' and price <= aktif['hedef_tp'])
+        )
+        if hedefe_ulasti:
+            kapanan = kapanisi_kaydet(aktif, aktif['hedef_tp'], 'Hedefe Ulaşıldı (TP)')
+            yeni_sinyali_islem_baslat_veya_bekle(genel_durum_deger)
+            return kapanan
+
+    # GENEL_DURUM DEĞİŞİMİ KONTROLÜ (mevcut mantık, aynen korunuyor)
     if genel_durum_deger == aktif['genel_durum']:
-        durumu_kaydet(aktif, 0)
+        aktif_durumu_kaydet(aktif, 0)
         return None
 
     sayac += 1
     if sayac < kapanis_esigi:
-        durumu_kaydet(aktif, sayac)
+        aktif_durumu_kaydet(aktif, sayac)
         return None
 
-    giris_fiyat = aktif['giris_fiyat']
-    yon = _islem_yonu(aktif['genel_durum'])
-    ham_degisim = (price - giris_fiyat) / giris_fiyat * 100
-    kar_yuzde = -ham_degisim if yon == 'short' else ham_degisim
-
-    kapanan = {
-        'kapanis_tarih': tarih_str, 'kapanis_saat': saat_str,
-        'sinyal': aktif['genel_durum'], 'yon': yon or 'belirsiz',
-        'giris_tarih': aktif['giris_tarih'], 'giris_saat': aktif['giris_saat'],
-        'giris_fiyat': giris_fiyat, 'cikis_fiyat': price, 'kar_yuzde': kar_yuzde
-    }
-    conn.execute(
-        f"INSERT INTO sinyal_{tf} (kapanis_tarih, kapanis_saat, sinyal, yon, giris_tarih, giris_saat, giris_fiyat, cikis_fiyat, kar_yuzde) VALUES (?,?,?,?,?,?,?,?,?)",
-        (kapanan['kapanis_tarih'], kapanan['kapanis_saat'], kapanan['sinyal'], kapanan['yon'],
-         kapanan['giris_tarih'], kapanan['giris_saat'], kapanan['giris_fiyat'], kapanan['cikis_fiyat'], kapanan['kar_yuzde'])
-    )
-
-    if not genel_durum_deger.startswith("İşlem Açma"):
-        durumu_kaydet(yeni_baslat(genel_durum_deger), 0)
-    else:
-        durumu_kaydet(None, 0)
-
+    kapanan = kapanisi_kaydet(aktif, price, 'Sinyal Değişimi')
+    yeni_sinyali_islem_baslat_veya_bekle(genel_durum_deger)
     return kapanan
 
 def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):

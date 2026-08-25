@@ -10,16 +10,18 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
-    """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., ...}}.
+    """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., 'hedef_cok_yakin': ..., ...}}.
     Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri Bekleniyor' DIŞINDA bir şey
     gösterip kendi son gönderilen durumundan FARKLI OLDUĞUNDA VE 'telegram_uygun'
     (konfirmasyon şartı — bkz. main.log_snapshot/sinyal.son_tf_genel_durumlar)
-    sağlandığında True döner. 15dk'nın telegram_uygun'u her zaman False'tur, yani
-    15dk hiçbir zaman tek başına mesaj tetiklemez.
+    sağlandığında VE 'hedef_cok_yakin' DEĞİLSE (fiyat, hedefin dayandığı likidite
+    kümesine %0.5'ten daha yakın değilse) True döner. 15dk'nın telegram_uygun'u
+    her zaman False'tur, yani 15dk hiçbir zaman tek başına mesaj tetiklemez.
 
-    ÖNEMLİ: bir değişiklik farkedilip henüz KONFİRME OLMADIYSA, _LAST_TELEGRAM_DURUMLAR
-    GÜNCELLENMEZ — böylece bir sonraki turda konfirmasyon sağlanırsa (aynı genel_durum
-    hâlâ geçerliyken) hâlâ 'yeni' sayılıp gönderilir. Sadece FİİLEN gönderilen (ya da
+    ÖNEMLİ: bir değişiklik farkedilip henüz KONFİRME OLMADIYSA YA DA hedef çok
+    yakın olduğu için engellendiyse, _LAST_TELEGRAM_DURUMLAR GÜNCELLENMEZ —
+    böylece bir sonraki turda şart(lar) sağlanırsa (aynı genel_durum hâlâ
+    geçerliyken) hâlâ 'yeni' sayılıp gönderilir. Sadece FİİLEN gönderilen (ya da
     'İşlem Açma'/'Veri Bekleniyor' gibi nötr) durumlar son-gönderilen state'i günceller."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
@@ -30,10 +32,11 @@ def should_send_telegram(tf_sonuclari):
             _LAST_TELEGRAM_DURUMLAR[tf] = gd
             continue
         if gd != onceki:
-            if sonuc.get('telegram_uygun'):
+            if sonuc.get('telegram_uygun') and not sonuc.get('hedef_cok_yakin'):
                 gonder = True
                 _LAST_TELEGRAM_DURUMLAR[tf] = gd
-            # konfirme olmadıysa onceki'yi güncelleme: değişiklik "beklemede" kalsın
+            # konfirme olmadıysa YA DA hedef çok yakınsa onceki'yi güncelleme:
+            # değişiklik "beklemede" kalsın
     return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
@@ -72,5 +75,5 @@ def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_
         lines.append("")
         lines.append("💰 <b>KAPANAN SİNYALLER</b>")
         for tf, k in kapanan_islemler.items():
-            lines.append(f"[{tf}] {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
+            lines.append(f"[{tf}] ({k['kapanis_tipi']}) {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
     return "\n".join(lines)

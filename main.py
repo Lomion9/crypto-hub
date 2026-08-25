@@ -8,7 +8,7 @@ from db import DB_FILE, HISTORY_FILE, VERI_COLS, _init_db, load_history
 from sinyal import (
     funding_status, _periyot_durumu, cvd_durumu, genel_durum, _islem_yonu,
     _periyot_cvd_degisimi, compute_adaptive_tf_thresholds,
-    son_tf_genel_durumlar, sinyal_performans_guncelle,
+    son_tf_genel_durumlar, sinyal_performans_guncelle, TRAP_KATEGORILERI,
 )
 from borsa import get_global_macro_data, get_btc_price, get_btc_ohlc_15m, get_binance_cvd
 from telegram import should_send_telegram, send_telegram_message, build_telegram_report
@@ -127,22 +127,63 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
 
         # HEDEF/TP: sadece 1sa ve üzeri, yönü belli (İşlem Açma/Veri Bekleniyor
         # dışında) sinyaller için -- 15dk artık kendi başına bir sinyal değil,
-        # bu yüzden hedef üretilmiyor (yon her zaman None döner, atlanır).
+        # bu yüzden hedef üretilmiyor.
+        #
+        # TRAP KATEGORİLERİ (Long Trap / Short Trap) ÖZEL: bunlar tespit
+        # edildiğinde pozisyon hemen açılmaz (bkz. sinyal.py notu) -- önce
+        # tuzaklanan yöndeki hedefe (bekleme_tetik_fiyat) ulaşılması beklenir,
+        # ulaşılınca GERÇEK (ters yönlü) pozisyon açılıp onun TP'si (hedef,
+        # ters yöndeki hedeften) kullanılır. İkisi de hedef_belirle'den geliyor,
+        # sadece farklı yönler için.
+        hedef = None
+        bekleme_tetik_fiyat = None
         if tf != '15dk' and genel != "Veri Bekleniyor":
-            yon = _islem_yonu(genel)
-            if yon:
-                if yon not in hedef_onbellek:
-                    hedef_onbellek[yon] = hedef_belirle(yon, db_path=path)
-                tf_sonuclari[tf]['hedef'] = hedef_onbellek[yon]
+            if genel in TRAP_KATEGORILERI:
+                orijinal_yon = TRAP_KATEGORILERI[genel]  # tuzaklanan/sürüklenen yön
+                gercek_yon = _islem_yonu(genel)           # tuzak tamamlanınca açılacak gerçek yön
 
-        # 15dk için AÇIK/KAPALI sinyal takibi (aktif_islem_15dk / sinyal_15dk)
-        # artık yapılmıyor -- 15dk sadece 1sa'nın confirm_kaynak'ı olarak
-        # (durum_15dk üzerinden) bir KONTROL NOKTASI, kendi başına izlenen/
-        # kapatılan bir sinyal değil. Her farklı genel_durum'da anında
-        # "kapanmış" sayılması hem gürültülüydü hem de kâr/zarar takibi
-        # anlamsızdı (15dk'da gerçek bir işlem açılmıyor zaten).
+                if orijinal_yon not in hedef_onbellek:
+                    hedef_onbellek[orijinal_yon] = hedef_belirle(orijinal_yon, db_path=path)
+                bekleme_hedef = hedef_onbellek[orijinal_yon]
+                bekleme_tetik_fiyat = bekleme_hedef['tp'] if bekleme_hedef else None
+                tf_sonuclari[tf]['bekleme_tetik_fiyat'] = bekleme_tetik_fiyat
+
+                if gercek_yon not in hedef_onbellek:
+                    hedef_onbellek[gercek_yon] = hedef_belirle(gercek_yon, db_path=path)
+                hedef = hedef_onbellek[gercek_yon]
+                tf_sonuclari[tf]['hedef'] = hedef
+            else:
+                yon = _islem_yonu(genel)
+                if yon:
+                    if yon not in hedef_onbellek:
+                        hedef_onbellek[yon] = hedef_belirle(yon, db_path=path)
+                    hedef = hedef_onbellek[yon]
+                    tf_sonuclari[tf]['hedef'] = hedef
+
+            # Fiyat, hedefin dayandığı likidite kümesine (hedef_fiyat -- TP'nin
+            # kendisi değil, TP'nin türetildiği ham küme fiyatı) ZATEN çok
+            # yakınsa (< %0.5) sinyal Telegram'a gönderilmiyor -- bu durumda
+            # hedef pratikte "tükenmiş" sayılır (fiyat oraya varmak üzere/vardı
+            # bile), yeni bir sinyal olarak bildirmek yanıltıcı olur. durum_{tf}
+            # tablosuna yazma ve genel akış (kâr/zarar takibi dahil) etkilenmez,
+            # sadece Telegram gönderimi engellenir.
+            if hedef:
+                mesafe_pct = abs(hedef['hedef_fiyat'] - price) / price * 100
+                tf_sonuclari[tf]['hedef_mesafe_pct'] = mesafe_pct
+                tf_sonuclari[tf]['hedef_cok_yakin'] = mesafe_pct < 0.5
+
+        # 15dk için AÇIK/KAPALI sinyal takibi (aktif_islem_15dk / sinyal_15dk /
+        # aktif_bekleme_15dk) artık yapılmıyor -- 15dk sadece 1sa'nın
+        # confirm_kaynak'ı olarak (durum_15dk üzerinden) bir KONTROL NOKTASI,
+        # kendi başına izlenen/kapatılan bir sinyal değil.
+        # tp=hedef['tp'] SADECE yeni açılacak bir pozisyon için kullanılır --
+        # zaten açık olan bir pozisyonun TP'si kendi hedef_tp'sinde sabit
+        # kalır (sinyal.py bunu ayrıca garanti ediyor).
         if tf != '15dk' and genel != "Veri Bekleniyor":
-            kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str, tf_conf.get('kapanis_esigi', 3))
+            tp = hedef['tp'] if hedef else None
+            kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str,
+                                                  tf_conf.get('kapanis_esigi', 3), tp=tp,
+                                                  bekleme_tetik_fiyat=bekleme_tetik_fiyat)
             if kapanan:
                 kapanan_islemler[tf] = kapanan
 
@@ -156,13 +197,20 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
             continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
+        if s['genel_durum'] in TRAP_KATEGORILERI and s.get('bekleme_tetik_fiyat'):
+            bekleme_satiri = f"        🪤 Tuzak tespit edildi, HENÜZ POZİSYON AÇILMADI — bekleniyor: ${s['bekleme_tetik_fiyat']:,.2f}"
+            if s.get('hedef'):
+                bekleme_satiri += f"  |  tetiklenince TP: ${s['hedef']['tp']:,.2f}"
+            print(bekleme_satiri)
         hedef = s.get('hedef')
-        if hedef:
+        if hedef and s['genel_durum'] not in TRAP_KATEGORILERI:
             print(f"        🎯 Hedef: ${hedef['hedef_fiyat']:,.2f} ({hedef['hedef_miktar_btc']:,.2f} BTC likidite)  |  TP: ${hedef['tp']:,.2f}")
+            if s.get('hedef_cok_yakin'):
+                print(f"        ⚠️ Fiyat hedefe çok yakın (%{s['hedef_mesafe_pct']:.2f} < %0.5) — Telegram'a gönderilmeyecek")
         elif hedef is None and 'hedef' in s:
             print(f"        ⚠️ Hedef bulunamadı (12s penceresinde karşıt yönde küme yok)")
     for tf, k in kapanan_islemler.items():
-        print(f"  💰 [{tf}] SİNYAL KAPANDI: {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
+        print(f"  💰 [{tf}] SİNYAL KAPANDI ({k['kapanis_tipi']}): {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
 
     return {
         'tarih': tarih_str, 'saat': saat_str, 'oi_btc': oi, 'price': price,

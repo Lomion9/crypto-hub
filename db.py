@@ -26,11 +26,34 @@ def _migrate_add_ohlc_columns(conn):
         if kolon not in mevcut_kolonlar:
             conn.execute(f"ALTER TABLE veri ADD COLUMN {kolon} REAL")
 
+def _migrate_add_tp_kolonlari(conn, tf):
+    """Var olan (eski şemalı) aktif_islem_{tf} ve sinyal_{tf} tablolarına, TP
+    (hedef fiyat) takibi için gereken kolonları ekler -- likidasyon hedefinden
+    gelen TP, pozisyon açıldığı anda aktif_islem_{tf}.hedef_tp'ye sabitlenip
+    saklanır (fiyat TP'ye ulaşınca genel_durum hiç değişmemiş olsa bile
+    pozisyon kapanır); sinyal_{tf}.kapanis_tipi ise bir kapanışın 'Hedefe
+    Ulaşıldı (TP)' mi yoksa 'Sinyal Değişimi' mi olduğunu ayırt etmek için."""
+    aktif_kolonlar = {row[1] for row in conn.execute(f"PRAGMA table_info(aktif_islem_{tf})").fetchall()}
+    if 'hedef_tp' not in aktif_kolonlar:
+        conn.execute(f"ALTER TABLE aktif_islem_{tf} ADD COLUMN hedef_tp REAL")
+
+    sinyal_kolonlar = {row[1] for row in conn.execute(f"PRAGMA table_info(sinyal_{tf})").fetchall()}
+    if 'kapanis_tipi' not in sinyal_kolonlar:
+        conn.execute(f"ALTER TABLE sinyal_{tf} ADD COLUMN kapanis_tipi TEXT")
+
 def _init_db(conn):
-    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem üçlüsü oluşturur.
-    durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır (otomatik artan değil, elle
-    veriliyor) — böylece hangi durum satırının hangi veri satırına ait olduğu asla
-    tarih+saat metin eşleşmesine bağlı kalmaz, id ile garanti hizalı kalır."""
+    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem/bekleme
+    dörtlüsü oluşturur. durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır
+    (otomatik artan değil, elle veriliyor) — böylece hangi durum satırının
+    hangi veri satırına ait olduğu asla tarih+saat metin eşleşmesine bağlı
+    kalmaz, id ile garanti hizalı kalır.
+
+    aktif_bekleme_{tf}: Long Trap / Short Trap kategorileri tespit edildiğinde
+    HEMEN pozisyon açılmaz -- tuzağın tamamlanması (fiyatın tuzaklanan yönde
+    likidite hedefine ulaşması) beklenir. Bu tablo o bekleme durumunu tutar:
+    genel_durum (hangi trap), tetik_fiyat (hedef_belirle'den gelen, ulaşılınca
+    gerçek pozisyonun açılacağı seviye), farkli_sayac (trap iptal sayacı,
+    aktif_islem_{tf} ile aynı mantık)."""
     conn.execute('''CREATE TABLE IF NOT EXISTS veri (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT, saat TEXT, oi_btc REAL, oi_usd REAL, funding_pct REAL,
@@ -51,6 +74,11 @@ def _init_db(conn):
             id INTEGER PRIMARY KEY CHECK (id = 1),
             genel_durum TEXT, giris_fiyat REAL, giris_tarih TEXT, giris_saat TEXT, farkli_sayac INTEGER
         )''')
+        conn.execute(f'''CREATE TABLE IF NOT EXISTS aktif_bekleme_{tf} (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            genel_durum TEXT, tetik_fiyat REAL, farkli_sayac INTEGER
+        )''')
+        _migrate_add_tp_kolonlari(conn, tf)
     conn.commit()
 
 def load_history(path=DB_FILE):
